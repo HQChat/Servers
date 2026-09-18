@@ -1,0 +1,21 @@
+# Keep the build context small and never bake secrets / local state into images.
+node_modules
+.git
+.gitignore
+
+# Secrets & local state (compose injects these via env_file / secrets at runtime).
+.env
+.env.*
+bot/.bot-seed
+bot/.bot-state.json
+
+# Editor / OS cruft
+.DS_Store
+*.log
+
+# Docs & deploy manifests are not needed inside the image.
+README.md
+LICENSE
+deploy/
+
+# NOTE: lib/libhqc_x86.so is intentionally NOT ignored — the image needs it.

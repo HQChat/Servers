@@ -1,0 +1,10 @@
+{
+  "dependencies": {
+    "pg": "^8.13.1",
+    "stripe": "^20.1.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.10",
+    "@types/stripe": "^8.0.416"
+  }
+}

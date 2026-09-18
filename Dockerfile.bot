@@ -1,0 +1,47 @@
+# DissQus helper bot.
+#
+# Same glibc base and the same native post-quantum lib as the relay: bot/bot.ts
+# imports lib/hqc, which dlopen's lib/libhqc_x86.so (links libc.so.6, so no
+# Alpine/musl) and is x86_64, so this image is linux/amd64.
+#
+# What this buys over reusing the server image with a `command:` override is
+# only the packages and sources the bot never touches — the base layer, the
+# native lib, and the shared lib/ + services/ code are identical either way.
+# See deploy/EXTRACTION_PLAN.md, which otherwise prefers one image, many
+# entrypoints.
+FROM node:22-bookworm-slim
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+# Install only what the bot's import graph reaches: mqtt (conversations — and it
+# pulls in `ws` itself for the ws:// transport, so neither may be pruned), pg
+# (services/db/api), koffi (lib/hqc), @sentry/node (lib/observability), dotenv,
+# and tsx (the sources run as TypeScript). Notably absent: stripe, which only
+# app-api uses. Before Phase 4 this also dropped `mqtt`; the bot now speaks MQTT
+# like the apps, so that would leave it unable to start.
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund --omit=dev \
+ && npm prune --omit=dev stripe 2>/dev/null || true \
+ && npm remove --no-save stripe \
+ && npm cache clean --force
+
+# Only the sources the bot actually imports.
+COPY lib/ ./lib/
+COPY services/ ./services/
+COPY bot/ ./bot/
+
+# Drop privileges. `node` owns the workdir for the bot's runtime writes
+# (.bot-seed / .bot-state.json when no volume is mounted).
+# BOT_STATE_DIR must EXIST in the image. Docker initialises an empty named
+# volume from the image's directory at that path -- contents and ownership -- and
+# creates it root-owned when there is nothing there to copy. The bot runs as
+# `node`, so the volume it was given was one it could not write:
+#
+#   EACCES: permission denied, open '/app/bot-state/.bot-seed'
+RUN mkdir -p /app/bot-state
+RUN chown -R node:node /app
+USER node
+
+# No HTTP surface to probe; liveness is "the process is still up".
+CMD ["node", "--import", "tsx", "bot/bot.ts"]

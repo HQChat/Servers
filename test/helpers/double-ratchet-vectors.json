@@ -1,0 +1,70 @@
+{
+  "_comment": "Cross-implementation known-answer vectors for the v2 KEM double ratchet. Asserted by BOTH services/server/test/double-ratchet.test.ts and apps/apple/tests/DoubleRatchetTests.swift, which READ this file rather than copying the hex (the v1 vectors were copy-pasted into the Swift test, so 'cross-impl' rested on someone remembering). If these drift, the Swift client and the TS bot no longer derive the same keys. All values hex.",
+  "version": 2,
+  "policy": {
+    "_comment": "Operational policy, asserted on both sides. v1 carried these as a prose contract ('MUST stay equal to their Swift twins') that no test checked.",
+    "maxSkipped": 2000,
+    "ratchetMinStepIntervalMs": 900000,
+    "ratchetMaxMessagesPerChain": 32
+  },
+  "input": {
+    "ssId": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+    "ssMt": "807f7e7d7c7b7a797877767574737271706f6e6d6c6b6a696867666564636261",
+    "ssOt": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+    "stepSs": "cafebabedeadbeef0123456789abcdeffedcba9876543210cafebabedeadbeef",
+    "rkPub": "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff"
+  },
+  "initRoot": {
+    "withOneTime": {
+      "root": "2cbc973024ce6db57d14781df896b323e18de6a2119b7c96fff52ca9e7d74f49",
+      "chain": "fbc505108dec26d38c806bd3199052920d3dc83689f23ce534ee98409d7d84cb"
+    },
+    "withoutOneTime": {
+      "root": "45b1efeec0b59fdf00789160e588283606dec659d83a8887e762a30197632deb",
+      "chain": "15233178b42f00ecd0c6ba619389fe894a371b5e8754d5b8fbc9ebeb844efec0"
+    }
+  },
+  "rootStep": {
+    "first": {
+      "root": "11dc6ff65fbfb74e22112e9711d2fe138db2f99e31f2d47037f09bb0235b6ed7",
+      "chain": "31f06690ad7025a651d70046c06ebbb261c14650b079434a4199a729b480953d"
+    },
+    "second": {
+      "root": "16f39fe347ad021c63a7855ee731041bc1767139478d022528a738f2a0781b8a",
+      "chain": "7f6bf78b97ea013c781525ce7cbc35415e648e5372140b60c7817c04b22ac938"
+    }
+  },
+  "chain": {
+    "_comment": "messageKey/chainNext walked from initRoot.withOneTime.chain",
+    "messageKeys_0_3": [
+      "6043e161b46f682f40d4072838024437bbe255376dda0a76fbe2737953e8f3d6",
+      "14b875a09caf4624c7c7955313ffee467ae0547930fe0e0f99d8d98ea0f1b2d4",
+      "92ef932edede71576a7f6ae0558456206ea9de53ff2f782397cce90375f3938b",
+      "7b33ca1ae009b77c6ce18f83611f8a06b40a4366b54a625784fef8efa5fda587"
+    ],
+    "afterConsuming_0_3": "0eb85176cd221c7cfe023ac6ea45eb7323fc3f8562e28cd954d6862e55b55209"
+  },
+  "walkChain": {
+    "_comment": "from=0, target=3 over initRoot.withOneTime.chain",
+    "messageKey": "7b33ca1ae009b77c6ce18f83611f8a06b40a4366b54a625784fef8efa5fda587",
+    "ck": "0eb85176cd221c7cfe023ac6ea45eb7323fc3f8562e28cd954d6862e55b55209",
+    "nextN": 4,
+    "skipped": [
+      {
+        "n": 0,
+        "key": "6043e161b46f682f40d4072838024437bbe255376dda0a76fbe2737953e8f3d6"
+      },
+      {
+        "n": 1,
+        "key": "14b875a09caf4624c7c7955313ffee467ae0547930fe0e0f99d8d98ea0f1b2d4"
+      },
+      {
+        "n": 2,
+        "key": "92ef932edede71576a7f6ae0558456206ea9de53ff2f782397cce90375f3938b"
+      }
+    ]
+  },
+  "chainId": {
+    "ofRkPub": "8be170100891a9068fb66aec80c76d0c"
+  }
+}

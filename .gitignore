@@ -1,0 +1,16 @@
+node_modules/
+.env
+*.log
+.DS_Store
+
+# Bot identity + per-friend key state, when running without a volume.
+.bot-seed
+.bot-state.json
+coverage/
+
+# Mutation testing. `.stryker-tmp` is a full copy of the source tree per
+# concurrent runner — it was committed once by a `git add -A` while a run was in
+# flight, which put a second copy of every file in the repo and tripped the
+# gitleaks gate on the fixtures inside it.
+.stryker-tmp/
+reports/

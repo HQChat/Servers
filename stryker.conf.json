@@ -1,0 +1,34 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Mutation testing over the crypto modules only. See docs at the bottom of this file's sibling: a surviving mutant in this code is a coverage lie.",
+  "packageManager": "npm",
+  "reporters": [
+    "progress",
+    "clear-text",
+    "json"
+  ],
+  "testRunner": "command",
+  "commandRunner": {
+    "command": "node --import tsx --test test/double-ratchet.test.ts test/envelope-v3.test.ts test/frame-conversation.test.ts test/handshake.test.ts test/decoder-degenerate.test.ts test/ratchet-session.test.ts test/envelope-init-shape.test.ts test/auth-proof-wire.test.ts"
+  },
+  "mutate": [
+    "lib/double-ratchet.ts",
+    "lib/envelope-v3.ts",
+    "lib/frame.ts",
+    "lib/handshake.ts"
+  ],
+  "coverageAnalysis": "off",
+  "timeoutMS": 120000,
+  "concurrency": 4,
+  "_thresholds_comment": "break was null, so mutation measured and gated nothing. 78 is a floor with headroom: enough that ordinary refactoring does not trip it, little enough that losing a class of oracle does. It was set at 80.65% against a 75.5% baseline, when the degenerate-length survivors were killed. The v2 removal has since deleted envelope.ts, which was the weakest module at 77.84% and 80 of the 222 survivors — so the score should be HIGHER now, not lower, and this floor is if anything too generous. Raise it once a run on the v3-only set has produced a number.",
+  "thresholds": {
+    "high": 90,
+    "low": 80,
+    "break": 78
+  },
+  "jsonReporter": {
+    "fileName": "reports/mutation/mutation.json"
+  },
+  "tempDirName": ".stryker-tmp",
+  "cleanTempDir": true
+}
