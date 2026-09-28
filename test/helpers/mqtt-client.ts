@@ -17,6 +17,7 @@
 import mqtt, { type MqttClient } from "mqtt";
 import * as crypto from "crypto";
 import { authProof } from "../../lib/auth-proof";
+import { newSigningKey, signConnect } from "../../lib/mqtt-proof";
 import { friendshipHash } from "../../lib/crypto-utils";
 import { keyMatchesId, peerId } from "../../lib/identity";
 import {
@@ -108,7 +109,19 @@ export class TestClient {
   username = "";
 
   private sessionToken = "";
+  /** The REST bearer, for e2e tests that call an auth route this helper does
+   *  not wrap (the hqn/1 suite registers its own signing key). */
+  get bearer(): string { return this.sessionToken; }
   private mqttToken = "";
+  private readonly signing = newSigningKey();
+  private mqttKeyId = "";
+  private clockOffsetSec = 0;
+  /** A fresh v1 proof per CONNECT; the token only against a server without v1. */
+  private mqttPassword(): string {
+    if (!this.mqttKeyId) return this.mqttToken;
+    return signConnect({ clientid: this.id, keyId: this.mqttKeyId, privateKey: this.signing.privateKey,
+      nowSec: Date.now() / 1000 + this.clockOffsetSec });
+  }
   private client: MqttClient | undefined;
   private sessions = new Map<string, SessionState>();
   /** Our own prekey secrets, by id. */
@@ -173,12 +186,17 @@ export class TestClient {
       // test failed on this and none of them could say why, because a wrong
       // proof and a wrong ENCODING of a right proof are the same 401.
       solution: authProof(ss).toString("base64"),
+      // A per-session signing key: every CONNECT below is a fresh v1 proof
+      // (lib/mqtt-proof.ts), the way the app and the bot connect.
+      mqttSigningKey: this.signing.publicKeyB64,
     });
     if (verify.status !== 200) {
       throw new Error(`auth/verify returned ${verify.status} ${JSON.stringify(verify.body)}`);
     }
     this.sessionToken = verify.body.sessionToken;
     this.mqttToken = verify.body.mqttToken;
+    this.mqttKeyId = typeof verify.body.mqttKeyId === "string" ? verify.body.mqttKeyId : "";
+    if (typeof verify.body.serverTime === "number") this.clockOffsetSec = verify.body.serverTime - Date.now() / 1000;
     // The server's view of who we are has to match ours, or every topic we touch
     // belongs to somebody else and the broker refuses it with 0x87.
     if (verify.body.id && verify.body.id !== this.id) {
@@ -225,7 +243,7 @@ export class TestClient {
         // every CONNECT packet.
         clientId: this.id,
         username: this.id,
-        password: this.mqttToken,
+        password: this.mqttPassword(),
         protocolVersion: 5,
         // Persistent — this is what makes the broker queue an `init` for a
         // client that is offline. On MQTT 5 that needs BOTH halves: `clean:

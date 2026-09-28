@@ -1,0 +1,9 @@
+{
+  "name": "hqcat-transport-bench",
+  "private": true,
+  "type": "module",
+  "description": "Transport benchmark: MQTT-over-WSS vs raw MQTTS, under impaired networks. Its own package.json so it does not pull the server's koffi/native HQC build, which it has no use for.",
+  "dependencies": {
+    "mqtt": "^5.15.2"
+  }
+}

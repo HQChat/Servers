@@ -5,11 +5,12 @@
 // /AUTH_VERIFY flow from server.ts with stateless REST:
 //
 //   POST /auth/free/init    { pk }                -> { ct }         (KEM challenge)
-//   POST /auth/free/verify  { pk, solution }      -> free session
+//   POST /auth/free/verify  { pk, solution, mqttSigningKey? } -> free session
 //   POST /auth/paid/init    { pk }                -> { ct } or 403   (admission gate)
-//   POST /auth/paid/verify  { pk, solution }      -> premium session
-//   POST /auth/refresh (Bearer sessionToken)      -> { mqttToken, ttl } (rotation)
-//   POST /mqtt/authn  (EMQX hook)                 -> { result }      (one-time token)
+//   POST /auth/paid/verify  { pk, solution, mqttSigningKey? } -> premium session
+//   POST /auth/refresh (Bearer) { mqttSigningKey? } -> key id + serverTime (+ legacy token)
+//   GET  /auth/transport                          -> the hqn/1 gateway, if enabled
+//   POST /mqtt/authn  (EMQX hook)                 -> { result }  (v1 signed proof, or legacy token)
 //
 // `pk` is the full public key, and these routes are the ONLY place it enters the
 // system: the server has to encapsulate to it, which nothing else in the stack
@@ -26,8 +27,9 @@
 // fall back instead of failing shut when a private (`allowlist`) server refuses
 // it. The full door's wire name is still "paid"; nothing behind it costs money.
 //
-// Transport confidentiality is TLS (WSS via nginx) — there is NO per-connection
-// AES session key here anymore (the SESSION_KEY step is deleted; TLS replaces it).
+// Transport confidentiality is TLS (WSS via nginx) or hqn/1 (raw TCP through
+// noise-gw, lib/noise.ts) — there is NO per-connection AES session key here any
+// more (the SESSION_KEY step is deleted; the transport replaces it).
 // Runs the SAME image as the monolith via `command:` in the compose overlay.
 
 // Must be first: loads .env + resolves *_FILE secrets before anything reads env.
@@ -42,6 +44,16 @@ import * as crypto from "crypto";
 // it out of the import graph lets the auth server boot — and serve the token/
 // refresh/authn paths — anywhere the lib is absent, matching secure-transport.ts).
 import { authProof } from "../lib/auth-proof";
+import { resolveTransportInfo } from "../lib/transport-config";
+import {
+  isV1Password,
+  parseProofPassword,
+  proofMessage,
+  isFreshTimestamp,
+  verifyProofSignature,
+  ed25519PublicKey,
+  MQTT_PROOF_NONCE_TTL_SECONDS,
+} from "../lib/mqtt-proof";
 import { checkAdmission, type Door } from "../lib/admission";
 import { peerId } from "../lib/identity";
 import { DB, type SessionScope } from "../services/db/api";
@@ -164,6 +176,75 @@ async function handleInit(req: http.IncomingMessage, res: http.ServerResponse, d
 }
 
 /**
+ * The optional `mqttSigningKey` a client registers at sign-in and refresh: the
+ * public half of its per-session Ed25519 key, raw 32 bytes, base64. Absent is
+ * fine — an older client still lives on the legacy token — but present and
+ * malformed is a 400, checked BEFORE anything is consumed, so a client bug
+ * cannot burn a sign-in challenge on its way to failing.
+ */
+function readSigningKey(body: any): Buffer | null {
+  if (body?.mqttSigningKey === undefined || body?.mqttSigningKey === null) return null;
+  const raw = Buffer.from(String(body.mqttSigningKey), "base64");
+  if (raw.length !== 32 || raw.toString("base64") !== String(body.mqttSigningKey) || !ed25519PublicKey(raw)) {
+    throw new HttpError(400, "INVALID_MQTT_SIGNING_KEY", "mqttSigningKey must be a raw 32-byte Ed25519 public key, base64");
+  }
+  return raw;
+}
+
+/** What a session response carries about the v1 CONNECT proof. `serverTime`
+ *  goes out on every response, key or not: the proof's timestamp is judged by
+ *  THIS clock, and a phone's can be minutes off. */
+async function mqttKeyFields(id: string, signingKey: Buffer | null) {
+  const serverTime = Math.floor(Date.now() / 1000);
+  if (!signingKey) return { serverTime };
+  const { keyId, expiresAt } = await DB.registerMqttKey(id, signingKey);
+  return { serverTime, mqttKeyId: keyId, mqttKeyExpiresAt: expiresAt };
+}
+
+/** Whether the pre-v1 opaque token is still accepted on CONNECT. Every client
+ *  in this repository signs its CONNECTs — the app, the helper bot, the e2e
+ *  client (run-local.sh runs the whole suite with this OFF to prove it) — so
+ *  the token remains only for app builds already installed. Turn it off with
+ *  `MQTT_LEGACY_TOKEN=0` once those have aged out. Read per request so it can be
+ *  flipped without a rebuild. */
+function legacyTokenAllowed(): boolean {
+  return process.env.MQTT_LEGACY_TOKEN !== "0";
+}
+
+type ConnectVerdict = { ok: true; expireAt: number } | { ok: false };
+
+/**
+ * Check a v1 CONNECT proof (lib/mqtt-proof.ts). The ORDER is the security:
+ *
+ *   shape → clientid binding → timestamp window → key lookup → signature → nonce
+ *
+ * The nonce is spent LAST, only for a proof that verified. Spend it earlier and
+ * anyone could burn a client's nonce with a garbage signature — harmless for a
+ * random 16-byte nonce, but it would make "the nonce was already used" mean
+ * two different things.
+ */
+async function verifyV1Connect(id: string, clientid: string, password: string): Promise<ConnectVerdict> {
+  const proof = parseProofPassword(password);
+  if (!proof) return { ok: false };
+  if (clientid !== id) {
+    logger.warn(`[auth] v1 CONNECT clientid does not match username id=${id.slice(0, 12)}…`);
+    return { ok: false };
+  }
+  if (!isFreshTimestamp(proof.ts, Math.floor(Date.now() / 1000))) return { ok: false };
+  const key = await DB.getMqttSessionKey(id, proof.keyId);
+  if (!key) return { ok: false };
+  const message = proofMessage(clientid, proof.keyId, proof.ts, proof.nonce);
+  if (!verifyProofSignature(key.publicKey, message, proof.sig)) return { ok: false };
+  if (!(await DB.useNonce(`v1:${id}:${proof.nonce.toString("hex")}`, MQTT_PROOF_NONCE_TTL_SECONDS))) {
+    // A valid signature on a spent nonce is a replayed CONNECT — the one case
+    // the proof exists to stop. Visible, because it means someone holds a copy.
+    logger.warn(`[auth] v1 CONNECT replayed for id=${id.slice(0, 12)}…`);
+    return { ok: false };
+  }
+  return { ok: true, expireAt: key.expireAt };
+}
+
+/**
  * Consume the challenge, re-check admission, and mint a session at the door's
  * scope.
  *
@@ -177,7 +258,9 @@ async function handleInit(req: http.IncomingMessage, res: http.ServerResponse, d
  * conversation it has and rebuild them on the next successful paid login.
  */
 async function handleVerify(req: http.IncomingMessage, res: http.ServerResponse, door: Door): Promise<void> {
-  const { pk, solution } = await readJson(req);
+  const body = await readJson(req);
+  const { pk, solution } = body;
+  const signingKey = readSigningKey(body);
   const pkHex = String(pk || "").toLowerCase();
   const id = peerId(pkHex);
   const solutionHex = Buffer.from(String(solution || ""), "base64").toString("hex");
@@ -225,6 +308,7 @@ async function handleVerify(req: http.IncomingMessage, res: http.ServerResponse,
   const username = await DB.getUsername(id);
   const sessionToken = await DB.mintSessionToken(id, scope);
   const mqttToken = await DB.mintMqttToken(id);
+  const keyFields = await mqttKeyFields(id, signingKey);
   return send(res, 200, {
     // The client's own identity, both halves. `id` is what it must present as
     // its MQTT client id and username; `pk` is echoed back so a client can
@@ -239,6 +323,8 @@ async function handleVerify(req: http.IncomingMessage, res: http.ServerResponse,
     // Absolute expiry (unix seconds) so the client can refresh proactively,
     // before EMQX force-disconnects at expire_at.
     mqttExpiresAt: Math.floor(Date.now() / 1000) + DB.MQTT_TOKEN_TTL_SECONDS,
+    // v1 CONNECT proof: the id of the key just registered, when one was sent.
+    ...keyFields,
   });
 }
 
@@ -262,6 +348,13 @@ export function createAuthHandler(): http.RequestListener {
       return send(res, 200, { ok: true, service: "auth" });
     }
 
+    // Where the raw-TCP transport lives and which keys to pin — and the switch
+    // that turns it off for everyone. Public, unauthenticated: a client asks
+    // before it has a session, and nothing in it is secret. lib/transport-config.ts.
+    if (method === "GET" && url === "/auth/transport") {
+      return send(res, 200, await resolveTransportInfo());
+    }
+
     // --- 1. HQC-KEM challenge, per door -------------------------------------
     if (method === "POST" && (url === "/auth/free/init" || url === "/auth/paid/init")) {
       return await handleInit(req, res, url === "/auth/paid/init" ? "paid" : "free");
@@ -279,23 +372,25 @@ export function createAuthHandler(): http.RequestListener {
     if (method === "POST" && url === "/auth/refresh") {
       const session = await DB.resolveSessionToken(bearer(req));
       if (!session) return send(res, 401, { error: "unauthenticated" });
+      const signingKey = readSigningKey(await readJson(req));
       const mqttToken = await DB.mintMqttToken(session.id);
       return send(res, 200, {
         mqttToken,
         scope: session.scope,
         mqttTtl: DB.MQTT_TOKEN_TTL_SECONDS,
         mqttExpiresAt: Math.floor(Date.now() / 1000) + DB.MQTT_TOKEN_TTL_SECONDS,
+        ...(await mqttKeyFields(session.id, signingKey)),
       });
     }
 
     // --- 4. EMQX HTTP authentication hook ------------------------------------
-    // EMQX posts { username, password, clientid, nonce? } on every CONNECT.
+    // EMQX posts { username, password, clientid } on every CONNECT.
     // Internal services present the privileged credential → superuser. Everyone
     // else: username = the CLIENT ID (sha256 of the hex public key), password =
     // the opaque token; we verify it and hand EMQX the token's `expire_at` so
     // EMQX DISCONNECTS the client at expiry → the client refreshes and
-    // reconnects (expiration-based rotation). Optional per-CONNECT nonce blocks
-    // exact-packet replay.
+    // reconnects (expiration-based rotation). A v1 password is instead a signed,
+    // single-use proof (lib/mqtt-proof.ts), and that is what blocks replay.
     // EMQX expects HTTP 200 with { result: "allow"|"deny", is_superuser?, expire_at? }.
     //
     // The username used to be the whole 14474-character public key, which the
@@ -310,7 +405,6 @@ export function createAuthHandler(): http.RequestListener {
       const body = await readJson(req);
       const username = String(body.username || "");
       const password = String(body.password || "");
-      const nonce = body.nonce ? String(body.nonce) : "";
 
       // Privileged internal identity (push-bridge, ops tools). No expiry.
       if (
@@ -324,14 +418,38 @@ export function createAuthHandler(): http.RequestListener {
       const id = username.toLowerCase();
       if (!id || !password) return send(res, 200, { result: "deny" });
 
-      // Replay guard: a captured CONNECT can't be resent with the same nonce.
-      if (nonce && !(await DB.useNonce(nonce))) {
-        logger.warn(`[auth] CONNECT nonce replay for id=${id.slice(0, 12)}…`);
-        return send(res, 200, { result: "deny" });
+      // v1: a signed, single-use proof (lib/mqtt-proof.ts). Decided by the
+      // password's shape alone — a legacy token is 64 hex characters and can
+      // never start with "v1.".
+      if (isV1Password(password)) {
+        const verdict = await verifyV1Connect(id, String(body.clientid || ""), password);
+        return send(res, 200, verdict.ok
+          ? { result: "allow", expire_at: verdict.expireAt }
+          : { result: "deny" });
       }
+      // The legacy token. It had an optional "CONNECT nonce" replay guard here
+      // that could never run — EMQX's authn body never carries a nonce, and
+      // MQTT 3.1.1 has no field for one. Replay protection is the v1 proof's
+      // single-use nonce above; a client that wants it signs its CONNECT.
+      if (!legacyTokenAllowed()) return send(res, 200, { result: "deny" });
 
       const { ok, expireAt } = await DB.verifyMqttToken(id, password);
       if (!ok) return send(res, 200, { result: "deny" });
+
+      // The token proves who the USERNAME is; the broker authorizes by the
+      // CLIENTID (`mqtt_acl WHERE id = ${clientid}`, emqx.conf). Unless the two
+      // are the same id, any client holding a token of its own could CONNECT as
+      // `clientid = <victim>`, inherit the victim's topic grants, and take over
+      // — kick — the victim's live session. Exact match against the lowercased
+      // username: an upper-cased clientid would match no ACL row anyway, and
+      // accepting it would only make the id mean two things. Checked after the
+      // token, so the warning names a real token holder trying it, not noise.
+      const clientid = String(body.clientid || "");
+      if (clientid !== id) {
+        logger.warn(`[auth] CONNECT clientid does not match username id=${id.slice(0, 12)}…`);
+        return send(res, 200, { result: "deny" });
+      }
+
       // expire_at (unix seconds) → EMQX force-disconnects at this time.
       return send(res, 200, { result: "allow", expire_at: expireAt });
     }

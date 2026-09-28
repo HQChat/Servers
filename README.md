@@ -85,4 +85,3 @@ publicly will not be the one you wrote.
 
 Please report vulnerabilities privately — see [SECURITY.md](SECURITY.md), and
 [the root policy](../../SECURITY.md) for scope and what counts as serious.
-# Servers

@@ -356,6 +356,7 @@ const DBImpl = {
       await c.query(`DELETE FROM mqtt_acl WHERE id = $1`, [id]);
       // MQTT connect credential + every live REST bearer.
       await c.query(`DELETE FROM mqtt_tokens WHERE id = $1`, [id]);
+      await c.query(`DELETE FROM mqtt_session_keys WHERE id = $1`, [id]);
       await c.query(`DELETE FROM sessions WHERE id = $1`, [id]);
       await c.query(`DELETE FROM push_tokens WHERE id = $1`, [id]);
       // Both prekey tiers. These are public keys, so leaving them would leak
@@ -1180,6 +1181,56 @@ const DBImpl = {
    *  the EMQX API (the "server can revoke" half of grant/revoke). */
   async revokeMqttAuth(id: string): Promise<void> {
     await q(`DELETE FROM mqtt_tokens WHERE id = $1`, [id]);
+    await q(`DELETE FROM mqtt_session_keys WHERE id = $1`, [id]);
+  },
+
+  /** Register the public half of a client's per-session Ed25519 key — the key
+   *  its v1 CONNECT proofs are signed with (lib/mqtt-proof.ts). Returns the key
+   *  id the client names it by, and its absolute expiry (unix seconds).
+   *
+   *  Keeps the two newest keys per id and drops the rest, expired or not: the
+   *  previous key survives so a CONNECT signed just before a refresh still
+   *  verifies, and nothing older is ever needed. No secret is stored — a copy
+   *  of this table lets nobody connect. */
+  async registerMqttKey(
+    id: string,
+    publicKey: Buffer,
+    ttlSeconds = MQTT_TOKEN_TTL_SECONDS
+  ): Promise<{ keyId: string; expiresAt: number }> {
+    if (publicKey.length !== 32) throw new Error("registerMqttKey: an Ed25519 public key is 32 bytes");
+    const keyId = crypto.randomBytes(16).toString('hex');
+    const row = await one<{ expire_at: string }>(
+      `INSERT INTO mqtt_session_keys (id, key_id, pubkey, expires_at)
+       VALUES ($1, $2, $3, now() + $4::interval)
+       RETURNING EXTRACT(epoch FROM expires_at)::bigint::text AS expire_at`,
+      [id, keyId, publicKey, secs(ttlSeconds)]
+    );
+    await q(
+      `DELETE FROM mqtt_session_keys
+        WHERE id = $1
+          AND (expires_at <= now()
+               OR key_id NOT IN (SELECT key_id FROM mqtt_session_keys
+                                  WHERE id = $1
+                                  ORDER BY created_at DESC, key_id
+                                  LIMIT 2))`,
+      [id]
+    );
+    return { keyId, expiresAt: Number(row!.expire_at) };
+  },
+
+  /** The live public key a v1 proof names, or null when it is unknown, expired
+   *  or revoked. */
+  async getMqttSessionKey(
+    id: string,
+    keyId: string
+  ): Promise<{ publicKey: Buffer; expireAt: number } | null> {
+    const row = await one<{ pubkey: Buffer; expire_at: string }>(
+      `SELECT pubkey, EXTRACT(epoch FROM expires_at)::bigint::text AS expire_at
+         FROM mqtt_session_keys
+        WHERE id = $1 AND key_id = $2 AND expires_at > now()`,
+      [id, keyId]
+    );
+    return row ? { publicKey: row.pubkey, expireAt: Number(row.expire_at) } : null;
   },
 
   /** Single-use nonce guard for a CONNECT. Returns true the FIRST time a nonce is
@@ -1189,7 +1240,7 @@ const DBImpl = {
    *  correct, because the decision is the write rather than a round trip before
    *  it. The DO UPDATE re-takes a nonce whose reservation has lapsed, which is
    *  what the Redis TTL did by deleting the key. */
-  async useNonce(nonce: string, ttlSeconds = MQTT_TOKEN_TTL_SECONDS): Promise<boolean> {
+  async useNonce(nonce: string, ttlSeconds: number): Promise<boolean> {
     const res = await q(
       `INSERT INTO mqtt_nonces (nonce, expires_at) VALUES ($1, now() + $2::interval)
        ON CONFLICT (nonce) DO UPDATE SET expires_at = EXCLUDED.expires_at

@@ -32,6 +32,8 @@ const VECTORS: Array<{ generator: string; file: string }> = [
   { generator: "scripts/gen-envelope-v3-vectors.ts", file: "test/helpers/envelope-v3-vectors.json" },
   { generator: "scripts/gen-handshake-vectors.ts", file: "test/helpers/handshake-vectors.json" },
   { generator: "scripts/gen-ratchet-vectors.ts", file: "test/helpers/double-ratchet-vectors.json" },
+  { generator: "scripts/gen-mqtt-proof-vectors.ts", file: "test/helpers/mqtt-proof-vectors.json" },
+  { generator: "scripts/gen-noise-hqn-vectors.ts", file: "test/helpers/noise-hqn-vectors.json" },
 ];
 
 function generate(generator: string): string {

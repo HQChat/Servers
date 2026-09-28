@@ -79,6 +79,7 @@ import {
   decodeHandshake,
 } from "../lib/handshake";
 import { authProof } from "../lib/auth-proof";
+import { newSigningKey, signConnect, type SigningKey } from "../lib/mqtt-proof";
 import { liveFriendIds, staleFriendIds } from "./friend-graph";
 import { reply as replyOf, type ReplyDeps } from "./replies";
 import { friendshipHash } from "../lib/crypto-utils";
@@ -330,9 +331,37 @@ function label(peerId_: string): string {
 // The `/ws` protocol carried all of this inline; it is now plain HTTP against
 // the auth server and app-api, exactly as the apps do it.
 
-/** REST session bearer (app-api + token refresh) and the current MQTT password. */
+/** REST session bearer (app-api + token refresh), and the pre-v1 MQTT token —
+ *  used only against a server that does not hand back a signing-key id. */
 let sessionToken = "";
 let mqttToken = "";
+
+/** The v1 CONNECT proof (lib/mqtt-proof.ts): a per-session Ed25519 key whose
+ *  public half is registered at sign-in and on every refresh, and the server
+ *  clock offset the proof's timestamp is corrected by. Every CONNECT signs a
+ *  fresh proof — which is why the bot reconnects by hand rather than letting
+ *  mqtt.js replay one password. */
+let mqttKey: SigningKey | null = null;
+let mqttKeyId = "";
+let clockOffsetSec = 0;
+
+function adoptSigningKey(key: SigningKey, body: any): void {
+  if (typeof body?.mqttKeyId === "string") {
+    mqttKey = key;
+    mqttKeyId = body.mqttKeyId;
+  } else {
+    mqttKey = null;   // a server that predates v1: the token is the password
+    mqttKeyId = "";
+  }
+  if (typeof body?.serverTime === "number") clockOffsetSec = body.serverTime - Date.now() / 1000;
+}
+
+/** The password for the next CONNECT: a fresh signed proof, or the token. */
+function mqttPassword(): string {
+  if (!mqttKey || !mqttKeyId) return mqttToken;
+  return signConnect({ clientid: myId, keyId: mqttKeyId, privateKey: mqttKey.privateKey,
+    nowSec: Date.now() / 1000 + clockOffsetSec });
+}
 
 /** A 401: the REST session itself is gone, so the KEM handshake must be redone. */
 class Unauthenticated extends Error { }
@@ -424,9 +453,10 @@ async function handshake(): Promise<void> {
     throw new Error(`${AUTH_DOOR}/init → ${init.status}`);
   }
   const ss = hqcDecapsulate(sk, Buffer.from(init.body.ct, "base64"));
+  const signing = newSigningKey();
   const verify = await httpJson(`${AUTH_BASE}${AUTH_DOOR}/verify`, {
     method: "POST",
-    body: { pk: pkHex, solution: authProof(ss).toString("base64") },
+    body: { pk: pkHex, solution: authProof(ss).toString("base64"), mqttSigningKey: signing.publicKeyB64 },
   });
   if (verify.status === 402 || verify.status === 403) {
     // Self-admission (registerExempt) should make this impossible; if it does
@@ -438,6 +468,7 @@ async function handshake(): Promise<void> {
   }
   sessionToken = verify.body.sessionToken;
   mqttToken = String(verify.body.mqttToken || "");
+  adoptSigningKey(signing, verify.body);
   logger.startup(`🤖 [bot] authenticated as ${short(myId)}`);
 }
 
@@ -448,12 +479,16 @@ async function handshake(): Promise<void> {
  */
 async function refreshMqttToken(): Promise<boolean> {
   if (!sessionToken) return false;
-  const r = await httpJson(`${AUTH_BASE}/auth/refresh`, { method: "POST", bearer: sessionToken });
+  const signing = newSigningKey();
+  const r = await httpJson(`${AUTH_BASE}/auth/refresh`, {
+    method: "POST", bearer: sessionToken, body: { mqttSigningKey: signing.publicKeyB64 },
+  });
   if (r.status === 401) return false;
   if (r.status !== 200 || typeof r.body?.mqttToken !== "string") {
     throw new Error(`/auth/refresh → ${r.status}`);
   }
   mqttToken = r.body.mqttToken;
+  adoptSigningKey(signing, r.body);
   return true;
 }
 
@@ -781,7 +816,7 @@ function connectMqtt() {
     // with 414.
     clientId: myId,
     username: myId,
-    password: mqttToken,
+    password: mqttPassword(),
     // MQTT 5, where 3.1.1 would do — because 3.1.1 gives the broker NO way to
     // say why it dropped us. It just closes the socket, and every cause arrives
     // as the same "connection closed".

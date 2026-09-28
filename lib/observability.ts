@@ -40,7 +40,7 @@ export function sentryEnabled(): boolean {
  */
 /** Which process is reporting — tags every Sentry event so processes are
  *  distinguishable. Extended for the MQTT extraction services. */
-export type Component = "server" | "bot" | "auth" | "api" | "push-bridge" | "broker-watch";
+export type Component = "server" | "bot" | "auth" | "api" | "push-bridge" | "broker-watch" | "noise-gw";
 
 export function initObservability(component: Component): void {
   if (started) return;
