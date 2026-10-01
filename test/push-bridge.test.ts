@@ -23,7 +23,7 @@ const HASH = "c".repeat(64);
 function spy(members: Record<string, string[]> = {}, outcome: SendOutcome = "sent") {
   const woke: string[] = [];
   const deps: PushDeps = {
-    getHashMembers: async (hash) => members[hash] ?? [],
+    getTopicMembers: async (id) => members[id] ?? [],
     send: async (id) => { woke.push(id); return outcome; },
   };
   return { deps, woke };
@@ -89,7 +89,7 @@ test("a topic whose middle segment is not a client id is ignored", async () => {
 test("a conversation message wakes the members who are offline", async () => {
   const { deps, woke } = spy({ [HASH]: [ID_A, ID_B] });
   const b = createPushBridge(deps);
-  await b.handleMessage(`c/${HASH}`, Buffer.from("ciphertext"));
+  await b.handleMessage(`cv/${HASH}`, Buffer.from("ciphertext"));
   assert.deepEqual(woke.sort(), [ID_A, ID_B].sort());
 });
 
@@ -98,33 +98,33 @@ test("…and never someone who is online", async () => {
   const b = createPushBridge(deps);
   await b.handleMessage(`u/${ID_A}/presence`, presence("online"));
 
-  await b.handleMessage(`c/${HASH}`, Buffer.from("ciphertext"));
+  await b.handleMessage(`cv/${HASH}`, Buffer.from("ciphertext"));
   assert.deepEqual(woke, [ID_B], "the online member must not be woken");
 
   // The sender being skipped is not a special case — it is this same rule, and
   // it only holds while their presence is current.
   await b.handleMessage(`u/${ID_A}/presence`, presence("offline"));
-  await b.handleMessage(`c/${HASH}`, Buffer.from("ciphertext"));
+  await b.handleMessage(`cv/${HASH}`, Buffer.from("ciphertext"));
   assert.deepEqual(woke, [ID_B, ID_A, ID_B], "once offline again, they are woken");
 });
 
-test("an unknown conversation hash wakes nobody", async () => {
-  // The bridge only ever parses a topic the broker authorized, so no members
-  // means the friendship row and the topic scheme disagree. The wrong answer
-  // here would be to wake everybody, or to throw.
+test("an unknown conversation id wakes nobody", async () => {
+  // No members means a retired topic (an ex-friend still holds its id) or a
+  // disagreement with friendships.convo_id. The wrong answer here would be to
+  // wake everybody, or to throw.
   const { deps, woke } = spy({});
   const b = createPushBridge(deps);
-  await b.handleMessage(`c/${HASH}`, Buffer.from("ciphertext"));
+  await b.handleMessage(`cv/${HASH}`, Buffer.from("ciphertext"));
   assert.deepEqual(woke, []);
 });
 
 test("the payload is never inspected — a wake is content-free", async () => {
   const bodies: string[] = [];
   const b = createPushBridge({
-    getHashMembers: async () => [ID_A],
+    getTopicMembers: async () => [ID_A],
     send: async (_id, title, body) => { bodies.push(`${title}|${body}`); return "sent"; },
   });
-  await b.handleMessage(`c/${HASH}`, Buffer.from("this is ciphertext and must not leak"));
+  await b.handleMessage(`cv/${HASH}`, Buffer.from("this is ciphertext and must not leak"));
   assert.deepEqual(bodies, ["New message|You have a new message"],
     "the notification says nothing about the message");
 });
@@ -134,18 +134,18 @@ test("a database failure does not take the bridge down", async () => {
   // handled, or a single poisoned topic ends push for everybody.
   const woke: string[] = [];
   const b = createPushBridge({
-    getHashMembers: async (hash) => { if (hash === HASH) throw new Error("pg is down"); return [ID_B]; },
+    getTopicMembers: async (id) => { if (id === HASH) throw new Error("pg is down"); return [ID_B]; },
     send: async (id) => { woke.push(id); return "sent"; },
   });
-  await b.handleMessage(`c/${HASH}`, Buffer.from("x"));   // must not throw
-  await b.handleMessage(`c/${"d".repeat(64)}`, Buffer.from("x"));
+  await b.handleMessage(`cv/${HASH}`, Buffer.from("x"));   // must not throw
+  await b.handleMessage(`cv/${"d".repeat(64)}`, Buffer.from("x"));
   assert.deepEqual(woke, [ID_B], "the bridge kept working after the failure");
 });
 
 test("a malformed conversation topic is ignored rather than guessed at", async () => {
   const { deps, woke } = spy({ [HASH]: [ID_A] });
   const b = createPushBridge(deps);
-  for (const topic of [`c/${HASH}x`, "c/short", `c/${HASH.toUpperCase()}`, `c/${HASH}/extra`, "c/"]) {
+  for (const topic of [`cv/${HASH}x`, "cv/short", `cv/${HASH.toUpperCase()}`, `cv/${HASH}/extra`, "cv/"]) {
     await b.handleMessage(topic, Buffer.from("x"));
   }
   assert.deepEqual(woke, []);

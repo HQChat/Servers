@@ -46,8 +46,8 @@ async function pair(t: { skip: (m: string) => void }) {
   await a.register(`e2e_a_${id}`);
   await b.register(`e2e_b_${id}`);
 
-  // Friendship is what grants the conversation topic AND publish on each
-  // other's inbox, so it has to land before either connects.
+  // Friendship is what mints the conversation's topic ids, which each side
+  // learns from /friends (subscribeConversation syncs), so it lands first.
   const invited = await a.api("POST", "/friends/invite", { to: b.username });
   // There used to be a `if (invited.status === 402) t.skip(...)` here, for when
   // the friend graph was a paid feature. It made this suite a no-op: the test
@@ -216,7 +216,7 @@ test("e2e: out-of-order delivery still decrypts", async (t) => {
   }
 });
 
-test("e2e: the topic ACL refuses a stranger", async (t) => {
+test("e2e: the static ACL keeps a stranger out of a conversation", async (t) => {
   if (!(await e2eAvailable())) return t.skip(SKIP);
   const p = await pair(t);
   if (!p) return;
@@ -226,21 +226,23 @@ test("e2e: the topic ACL refuses a stranger", async (t) => {
     await stranger.register(`e2e_x_${tag()}`);
     await stranger.connect();
 
-    // The topic name is derivable by anyone who knows both client ids — and an
-    // id is itself derivable by anyone holding the public key — so authorization
-    // rests ENTIRELY on the ACL table, never on topic secrecy. A stranger who
-    // computes it must still be refused.
-    const convo = `c/${friendshipHash(a.id, b.id)}`;
-    // The payload is deliberately not a real frame — the ACL refuses the
-    // PUBLISH before anything reads a byte of it, which is the property under
-    // test. It used to be a v2-shaped JSON object; a string makes it plainer
-    // that its contents were never the point.
-    const pub = await stranger.publishRaw(convo, "not a frame");
-    assert.equal(pub.accepted, false, "a non-member cannot publish to the conversation topic");
+    // The conversation topic is a random id the stranger was never handed, and
+    // the broker allows `cv/+` to anyone — so the ONE thing that keeps it
+    // private is that no client may subscribe with a wildcard. Every spelling
+    // of "everything" must be refused (infra/deploy/emqx/acl.conf).
+    for (const filter of ["#", "cv/+", "cv/#", "hs/+", "u/+/presence", "+/+"]) {
+      assert.equal(await stranger.subscribeRaw(filter), false, `a wildcard ${filter} was granted`);
+    }
+    // Nor another client's inbox or graph: those are keyed on the clientid.
+    assert.equal(await stranger.subscribeRaw(`u/${b.id}/inbox`), false, "subscribed to someone else's inbox");
+    assert.equal(await stranger.subscribeRaw(`u/${b.id}/graph`), false, "subscribed to someone else's graph");
+    // And the old derivable topic is dead: nobody may use `c/{hash}` at all.
+    assert.equal(await stranger.subscribeRaw(`c/${friendshipHash(a.id, b.id)}`), false,
+      "the retired derivable topic is still usable");
 
-    // Nor into a stranger's inbox: the publish grant comes with a friendship.
-    const inbox = await stranger.publishRaw(`u/${b.id}/inbox`, "{}");
-    assert.equal(inbox.accepted, false, "a non-member cannot publish to an inbox");
+    // The inbox is open to PUBLISH by design, and a stranger's frame there is
+    // dropped by the recipient. What must not happen is it reaching B's app.
+    await stranger.publishRaw(`u/${b.id}/inbox`, "not a frame");
 
     // And the real members are unaffected.
     await a.send(b, "still working");
@@ -328,24 +330,31 @@ test("e2e: unfriending DROPS the live subscription, not just the next check", as
     assert.equal((await b.next()).text, "before");
     const delivered = b.inbox.length;
 
-    // The property that has NEVER worked on this deployment. `revokeFriendTopic`
-    // deletes the ACL row, but EMQX checks authorization at SUBSCRIBE — so an
-    // open subscription keeps delivering until the client disconnects. The admin
-    // call that closes that window built a ~14.5 kB URL out of two public keys
-    // and came back 414 every single time, silently, because a failed kick is
-    // best-effort and only logged.
+    // Unfriending retires the topic ids, but both members already HOLD them —
+    // and an open subscription keeps delivering until something drops it. The
+    // admin call that does built a ~14.5 kB URL out of two public keys and came
+    // back 414 every single time, silently, because it is best-effort and only
+    // logged.
+    const retired = a.conversationWith(b.id);
     const removed = await a.api("POST", "/friends/remove", { peer: b.id });
     assert.equal(removed.status, 200, "the unfriend itself succeeds");
 
     // Give the broker a moment to process the dropped subscription.
     await new Promise((r) => setTimeout(r, 1000));
 
-    // A publish on the shared topic must not reach B any more. A is refused by
-    // the ACL, so this is deliberately a RAW publish of a frame B would
-    // otherwise have accepted — the question is delivery, not sealing.
-    await a.publishRaw(`c/${friendshipHash(a.id, b.id)}`, "not a frame");
+    // A publish on the retired topic must not reach B any more. The broker
+    // still ALLOWS it — any exact `cv/…` is — so this is the admin API's drop
+    // of B's subscription under test, not the ACL. Deliberately a RAW publish:
+    // the question is delivery, not sealing.
+    const dropsBefore = b.drops.length;
+    await a.publishRaw(retired, "not a frame");
     await new Promise((r) => setTimeout(r, 1500));
     assert.equal(b.inbox.length, delivered, "nothing new reached the unfriended peer");
+    // The inbox count alone cannot tell: "not a frame" would be DROPPED by B's
+    // decoder rather than counted, so a still-open subscription would pass that
+    // assertion. A drop naming the retired topic is the delivery itself.
+    assert.ok(!b.drops.slice(dropsBefore).some((d) => d.includes(retired)),
+      `the retired topic still delivered to B: ${JSON.stringify(b.drops.slice(dropsBefore))}`);
   } finally {
     await Promise.all([a.close(), b.close()]);
   }

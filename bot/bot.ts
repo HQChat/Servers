@@ -82,7 +82,7 @@ import { authProof } from "../lib/auth-proof";
 import { newSigningKey, signConnect, type SigningKey } from "../lib/mqtt-proof";
 import { liveFriendIds, staleFriendIds } from "./friend-graph";
 import { reply as replyOf, type ReplyDeps } from "./replies";
-import { friendshipHash } from "../lib/crypto-utils";
+import { TOPIC_ID } from "../lib/topics";
 import { keyMatchesId, peerId } from "../lib/identity";
 import { DB } from "../services/db/api";
 
@@ -175,6 +175,14 @@ interface FriendState {
   // Whether this user has had the welcome message. Persisted with the rest of
   // the friend state so a bot restart never re-greets someone.
   greeted?: boolean;
+  /**
+   * The friendship's topic ids, from /friends: `cv/{convoId}` and
+   * `hs/{handshakeId}`. Random per friendship (009_friendship_topics.sql), so
+   * nothing derives them — absent means "not synced yet", and nothing is
+   * published or subscribed for this peer until they arrive.
+   */
+  convoId?: string;
+  handshakeId?: string;
 }
 
 /// Keyed by the peer's CLIENT ID — the same identity the conversation topic, the
@@ -510,8 +518,8 @@ async function syncGraph(): Promise<void> {
     const from = String(invite?.id || "").toLowerCase();
     if (!from) continue;
     logger.debug(`🤖 [bot] invite from @${invite?.username ?? short(from)} — accepting`);
-    // Accepting is also what grants BOTH of us the conversation topic in the
-    // EMQX ACL, so it must land before we try to subscribe.
+    // Accepting creates the friendship, and with it the topic ids the /friends
+    // read below hands us — so it must land before that read.
     await api("POST", "/friends/accept", { from });
   }
 
@@ -524,10 +532,19 @@ async function syncGraph(): Promise<void> {
     return;
   }
 
-  for (const friend of (list.friends ?? []) as Array<{ id?: string; username?: string }>) {
+  for (const friend of (list.friends ?? []) as Array<{
+    id?: string; username?: string; convo_id?: string; handshake_id?: string;
+  }>) {
     const peerId_ = String(friend?.id || "").toLowerCase();
     if (!live.has(peerId_)) continue;
-    trackFriend(peerId_, String(friend?.username || ""));
+    const convoId = String(friend?.convo_id || "");
+    const handshakeId = String(friend?.handshake_id || "");
+    if (!TOPIC_ID.test(convoId) || !TOPIC_ID.test(handshakeId)) {
+      // A server without 009 — nothing to address this peer on yet.
+      logger.warn(`🤖 [bot] /friends gave no topic ids for @${friend?.username ?? short(peerId_)} — skipping`);
+      continue;
+    }
+    trackFriend(peerId_, String(friend?.username || ""), { convoId, handshakeId });
   }
   pruneFriends(live);
 }
@@ -537,11 +554,12 @@ async function syncGraph(): Promise<void> {
  *
  * This is what kept the bot in a permanent reconnect loop. `syncGraph` only ever
  * ADDED, so an unfriended peer stayed in `.bot-state.json` for good — while
- * `revokeFriendTopic` deleted its row from `mqtt_acl`. Every reconnect the bot
- * subscribed to a topic it was no longer entitled to, and with
- * `authorization.deny_action = disconnect` the broker answered by closing the
- * link. Connect, subscribe, 0x87, drop, repeat, for as long as that entry
- * existed — which was forever, because nothing removed it.
+ * its topic grant was revoked. Every reconnect the bot subscribed to a topic it
+ * was no longer entitled to, and with the `deny_action = disconnect` of that era
+ * the broker answered by closing the link. Connect, subscribe, 0x87, drop,
+ * repeat, for as long as that entry existed — which was forever, because nothing
+ * removed it. (The broker refuses only the packet now, and a retired topic id is
+ * simply one nobody publishes to — but a stale peer is still stale.)
  *
  * The damage was worse than one dead conversation: the denial arrives mid-batch,
  * and `subscribeConversation` returns early once the link is gone, so every
@@ -557,28 +575,39 @@ function pruneFriends(live: Set<string>) {
     // exists, and keeping it would let a re-friend resume a ratchet the peer has
     // long since dropped.
     const name = label(peerId_);
+    const retired = friendTopics(peerId_);
     delete state.friends[peerId_];
-    // Best-effort — the grant is already gone, so this may be refused too. It is
-    // issued anyway so a peer removed WHILE we are connected stops being
-    // delivered without waiting for a reconnect.
-    if (client?.connected) client.unsubscribe(convoTopic(peerId_), () => { });
-    logger.warn(
-      `🤖 [bot] dropped @${name} — no longer in the friend graph ` +
-      `(its topic grant is revoked, and re-subscribing to it drops the link)`
-    );
+    // So a peer removed WHILE we are connected stops being delivered without
+    // waiting for a reconnect. app-api drops it through the admin API as well;
+    // this is the bot not relying on that.
+    if (client?.connected && retired.length) client.unsubscribe(retired, () => { });
+    logger.warn(`🤖 [bot] dropped @${name} — no longer in the friend graph`);
   }
   saveState();
 }
 
 /** Ensure state + subscription + key agreement for one peer. Idempotent. */
-function trackFriend(peerId_: string, username: string) {
+function trackFriend(
+  peerId_: string,
+  username: string,
+  topics: { convoId: string; handshakeId: string }
+) {
   const known = state.friends[peerId_];
   const f: FriendState = known ?? { id: peerId_ };
   const renamed = !!username && username !== f.username;
   if (renamed) f.username = username;
+  // New ids for a peer we already track: unfriended and re-friended between
+  // two syncs. The old topics are retired — leave them.
+  const moved = f.convoId !== topics.convoId || f.handshakeId !== topics.handshakeId;
+  if (moved) {
+    const retired = friendTopics(peerId_);
+    if (client?.connected && retired.length) client.unsubscribe(retired, () => { });
+    f.convoId = topics.convoId;
+    f.handshakeId = topics.handshakeId;
+  }
   state.friends[peerId_] = f;
   // The poll runs every few seconds; only touch the state file when it changed.
-  if (!known || renamed) saveState();
+  if (!known || renamed || moved) saveState();
   if (!known) logger.debug(`🤖 [bot] friend: @${username || short(peerId_)}`);
   subscribeConversation(peerId_);
   // Nothing to do about a missing session here. v1 re-offered its KEM ciphertext
@@ -642,9 +671,10 @@ function adoptSenderKey(f: FriendState, env: Frame): void {
 }
 
 // ── MQTT conversations ───────────────────────────────────────────────────────
-// One topic per friendship, `c/{friendshipHash}`, which only the two members may
-// publish to (EMQX enforces it from the `mqtt_acl` table app-api maintains). The broker
-// sees ciphertext and our own public key, never plaintext.
+// One topic per friendship, `cv/{convoId}`, a random id only the two members are
+// handed. The broker allows any exact `cv/…` and refuses wildcards, so knowing
+// the id IS the permission (infra/deploy/emqx/acl.conf). The broker sees
+// ciphertext and our own public key, never plaintext.
 
 let client: MqttClient | null = null;
 /** True while a relink is already scheduled/in flight, so one drop = one retry. */
@@ -656,8 +686,15 @@ const MAX_RELINK_MS = 30_000;
  *  (We can't just drop its listeners — mqtt.js keeps its own on the client.) */
 let linkGeneration = 0;
 
-function convoTopic(peerId_: string): string {
-  return `c/${friendshipHash(myId, peerId_)}`;
+/** The conversation topic with this peer, or null before /friends gave us its id. */
+function convoTopic(peerId_: string): string | null {
+  const id = state.friends[peerId_]?.convoId;
+  return id ? `cv/${id}` : null;
+}
+
+/** Both of a friendship's topics that we hold — for (un)subscribing together. */
+function friendTopics(peerId_: string): string[] {
+  return [convoTopic(peerId_), handshakeTopic(peerId_)].filter((t): t is string => t !== null);
 }
 const PRESENCE_TOPIC = `u/${myId}/presence`;
 const PRESENCE_ONLINE = JSON.stringify({ s: "online" });
@@ -687,6 +724,10 @@ function publish(peerId_: string, envelope: Frame) {
     return;
   }
   const topic = envelope.t === "init" ? inboxTopic(peerId_) : convoTopic(peerId_);
+  if (!topic) {
+    logger.warn(`🤖 [bot] no topic id yet for @${label(peerId_)} — ${envelope.t} not sent`);
+    return;
+  }
   // QoS 1 into the client's own outgoing store: a publish issued while the link
   // is down is delivered on the next connect rather than lost.
   client.publish(topic, bytes, { qos: 1 });
@@ -698,15 +739,17 @@ function inboxTopic(peerId_: string): string {
 }
 
 /**
- * Where the two of us prove an `init` came from the peer it names.
+ * Where the two of us prove an `init` came from the peer it names, or null
+ * before /friends gave us its id.
  *
- * A separate topic from the inbox, and that is the point: every friend may
- * publish to an inbox, so a challenge sitting there would be readable — and
- * forgeable — by exactly the attacker this exchange exists to stop. Only the two
- * members are granted this one (DB.grantFriendTopic).
+ * A separate topic from the inbox, and that is the point: anyone may publish to
+ * an inbox, so a challenge sitting there would be readable — and forgeable — by
+ * exactly the attacker this exchange exists to stop. `hs/{handshakeId}` is a
+ * random id only the two members are handed.
  */
-function handshakeTopic(peerId_: string): string {
-  return `h/${friendshipHash(myId, peerId_)}`;
+function handshakeTopic(peerId_: string): string | null {
+  const id = state.friends[peerId_]?.handshakeId;
+  return id ? `hs/${id}` : null;
 }
 
 /** Our own inbox — where peers put their `init` frames. Subscribed on every
@@ -722,8 +765,8 @@ function subscribeInbox() {
     if (refused.length) {
       logger.error(
         `🤖 [bot] subscribe REFUSED for our OWN inbox ${inboxTopic(myId)} ` +
-        `(0x${refused[0]!.qos.toString(16)}) — grantSelfTopics has not run for this id, ` +
-        `or its row is missing from mqtt_acl`
+        `(0x${refused[0]!.qos.toString(16)}) — the broker's static ACL does not match ` +
+        `this clientid (infra/deploy/emqx/acl.conf)`
       );
     }
   });
@@ -731,11 +774,13 @@ function subscribeInbox() {
 
 function subscribeConversation(peerId_: string) {
   if (!client?.connected) return; // (re)subscribed wholesale on CONNACK
-  // The handshake topic rides along with the conversation: they are granted
+  // The handshake topic rides along with the conversation: they are handed out
   // together and there is never a reason to hold one without the other.
-  const op = `SUBSCRIBE ${convoTopic(peerId_)} (conversation with @${label(peerId_)})`;
+  const topics = friendTopics(peerId_);
+  if (topics.length !== 2) return; // not synced yet — trackFriend resubscribes
+  const op = `SUBSCRIBE ${topics[0]} (conversation with @${label(peerId_)})`;
   opStart(op);
-  client.subscribe([convoTopic(peerId_), handshakeTopic(peerId_)], { qos: 1 }, (err, granted) => {
+  client.subscribe(topics, { qos: 1 }, (err, granted) => {
     opDone(op);
     if (err) {
       logger.error(`🤖 [bot] subscribe ${label(peerId_)}: ${err.message}`);
@@ -753,9 +798,9 @@ function subscribeConversation(peerId_: string) {
     const refused = (granted ?? []).filter((g) => g.qos >= 128);
     if (refused.length) {
       logger.error(
-        `🤖 [bot] subscribe REFUSED for ${label(peerId_)} on ${convoTopic(peerId_)} ` +
-        `(0x${refused[0]!.qos.toString(16)}) — the EMQX ACL has no grant for this pair ` +
-        `(mqtt_acl); nothing will be received`
+        `🤖 [bot] subscribe REFUSED for ${label(peerId_)} on ${topics[0]} ` +
+        `(0x${refused[0]!.qos.toString(16)}) — the static ACL refused a cv/ or hs/ ` +
+        `topic, which it allows to everyone: check acl.conf; nothing will be received`
       );
     }
   });
@@ -771,8 +816,9 @@ function subscribeConversation(peerId_: string) {
  * client id.
  */
 const DISCONNECT_REASONS: Record<number, string> = {
-  0x87: "0x87 NOT AUTHORIZED — an ACL denial (deny_action=disconnect). " +
-    "Check mqtt_acl for this pk; note the authorizer caches for 15m",
+  0x87: "0x87 NOT AUTHORIZED — an ACL denial. The broker's ACL is static " +
+    "(infra/deploy/emqx/acl.conf) and refuses per packet; a disconnect for it " +
+    "means the broker is running a config with deny_action=disconnect",
   0x8e: "0x8E SESSION TAKEN OVER — another connection used the same client id " +
     "(a second bot process, or an old container still running)",
   0x8d: "0x8D KEEPALIVE TIMEOUT — we stopped responding (a blocked event loop)",
@@ -979,7 +1025,8 @@ function sweepChallenges(now = Date.now()) {
  * commitment does its job — and only that peer can decapsulate.
  */
 function challengeInitiator(f: FriendState, env: Frame, aad: Buffer): void {
-  if (!client || !env.senderPk) return;
+  const topic = handshakeTopic(f.id);
+  if (!client || !env.senderPk || !topic) return;
   sweepChallenges();
 
   const nonce = handshakeNonce();
@@ -997,7 +1044,7 @@ function challengeInitiator(f: FriendState, env: Frame, aad: Buffer): void {
     expiresAt: Date.now() + HANDSHAKE_TTL_MS,
   });
   client.publish(
-    handshakeTopic(f.id),
+    topic,
     encodeHandshake({ kind: "chal", from: myId, to: f.id, nonce, ct }),
     { qos: 1 }
   );
@@ -1012,9 +1059,9 @@ function onHandshake(topic: string, raw: Buffer) {
   if (frame.from === myId) return;        // our own publish, echoed back
   const f = state.friends[frame.from];
   if (!f) return;
-  // The topic is derived from the two ids, so a frame claiming to be from a peer
-  // must arrive on the topic that peer's id builds — the same rule `onEnvelope`
-  // applies to conversation frames.
+  // A frame claiming to be from a peer must arrive on the handshake topic of
+  // OUR friendship with that peer — the same rule `onEnvelope` applies to
+  // conversation frames. A null (not synced) never equals a real topic.
   if (topic !== handshakeTopic(frame.from)) return;
 
   if (frame.kind === "chal") {
@@ -1029,7 +1076,7 @@ function onHandshake(topic: string, raw: Buffer) {
     // unforgeable, and the one an impersonator does not have.
     try { ss = hqcDecapsulate(sk, frame.ct); } catch { return; }
     client?.publish(
-      handshakeTopic(frame.from),
+      topic,
       encodeHandshake({
         kind: "proof",
         from: myId,
@@ -1074,7 +1121,7 @@ async function onEnvelope(topic: string, raw: Buffer) {
   // arrived, because the header is the frame's own prefix. Taking it from there
   // rather than rebuilding it is what makes this function unable to pick wrong.
   // The handshake topic carries its own two frame kinds and no envelope.
-  if (topic.startsWith("h/")) return onHandshake(topic, raw);
+  if (topic.startsWith("hs/")) return onHandshake(topic, raw);
 
   const decoded = decodeFrame(raw);
   if (!decoded) return;  // not a well-formed frame
@@ -1655,12 +1702,13 @@ if (require.main === module) {
 // --- The testable seam ------------------------------------------------------
 //
 // Exported for test/bot-internals.test.ts. Deliberately the pure decisions
-// rather than the wiring: topic derivation (a FOURTH copy of a scheme the server
-// and the Swift client also spell out), frame-header parsing (attacker-controlled
-// input), and the session persistence round-trip (get it wrong and every
-// conversation resets on restart).
+// rather than the wiring: which topic a peer is addressed on (`state` is exported
+// so a test can hand it the ids /friends would), frame-header parsing
+// (attacker-controlled input), and the session persistence round-trip (get it
+// wrong and every conversation resets on restart).
 export {
   myId,
+  state,
   convoTopic,
   inboxTopic,
   handshakeTopic,

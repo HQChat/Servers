@@ -1,13 +1,12 @@
-// The load test LAT-4 has been open for, and the measurement LAT-3 is waiting on.
+// The load test LAT-4 has been open for.
 //
 //   LAT-4 (MEDIUM, open): "No load test exists for the MQTT architecture."
-//   LAT-3 (open): the ACL cache TTL is 1m and wants to be 15m, "open until LAT-4
-//                 measures it" — that is the ACL query rate this file reports.
+//   LAT-3 is moot: it asked how often the broker's Postgres ACL was queried, and
+//                 the broker no longer has one (its ACL is a static file).
 //
 // WHAT THIS IS NOT. It is not a benchmark of the broker, and the absolute numbers
 // from a laptop mean nothing about a droplet. What it produces is a SHAPE: how
-// fan-out latency behaves as concurrency rises, and how many authorization
-// queries one conversation costs. A p99 that is flat from 2 clients to 40 says
+// fan-out latency behaves as concurrency rises. A p99 that is flat from 2 clients to 40 says
 // something different from one that is not, on any hardware.
 //
 // It is also the only test here that can fail for a reason that is not a bug —
@@ -47,14 +46,12 @@
 // settled message against 2000ms), which is the outcome that lets them stay
 // loose: they are catching a collapse, not policing a number.
 //
-// LAT-4 is closed by this run. LAT-3 is answered by the settled-conversation
-// line: an ACL lookup per message would show as a step change against the 51.2ms
-// baseline, and 54.3ms is not one.
+// LAT-4 is closed by this run.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { TestClient, e2eAvailable, loadCrypto } from "../helpers/mqtt-client";
-import { q, disconnect } from "../../services/db/pg";
+import { disconnect } from "../../services/db/pg";
 import { setLogLevel } from "../../lib/logger";
 
 setLogLevel("silent");
@@ -223,41 +220,6 @@ test("fan-out latency and ACL cost under concurrency", async (t) => {
       `fan-out is not degrading gracefully with concurrency`);
   } finally {
     await Promise.all(pairs.flatMap(({ a, b }) => [a.close(), b.close()]));
-  }
-});
-
-test("the ACL query rate, which LAT-3 is waiting on", async (t) => {
-  if (!(await stackOrSkip(t))) return;
-  // EMQX consults mqtt_acl on an authorization cache MISS. The cache TTL is 1
-  // minute and the open question is whether 15 is safe — which is a question
-  // about how often a real conversation forces a lookup.
-  //
-  // Measured through pg_stat_statements where available, and by row count
-  // otherwise, because the point is the SHAPE: does a steady conversation keep
-  // querying, or does it settle?
-  const crypto = await loadCrypto();
-  const { a, b } = await pair(crypto, `acl${tag()}`);
-
-  try {
-    const rows = await q<{ n: string }>(`SELECT count(*)::text AS n FROM mqtt_acl`);
-    console.log(`\n  mqtt_acl holds ${rows.rows[0]?.n ?? "?"} rows`);
-
-    // A conversation's steady state: after the first few messages, an
-    // authorization decision should be cached and not re-queried.
-    const t0 = performance.now();
-    for (let i = 0; i < 30; i++) {
-      await a.send(b, `acl-${i}`);
-      await b.next();
-    }
-    const perMessage = (performance.now() - t0) / 30;
-    console.log(`    30 messages on one settled conversation: ${ms(perMessage)} each`);
-    console.log(`    → an ACL lookup per message would show as a step change here;`);
-    console.log(`      a flat number is what makes raising the TTL to 15m uninteresting.`);
-
-    assert.ok(perMessage < 2_000, `${ms(perMessage)} per message on a settled conversation`);
-  } finally {
-    await a.close();
-    await b.close();
   }
 });
 

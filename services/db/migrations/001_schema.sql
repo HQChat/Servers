@@ -204,8 +204,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS mqtt_acl_pk_topic_key
   ON mqtt_acl (pk_digest(pk), pk_digest(topic));
 CREATE INDEX IF NOT EXISTS mqtt_acl_pk_hash_idx ON mqtt_acl USING hash (pk);
 
--- The one table the broker's role may read (see 000_roles.sql).
-GRANT SELECT ON mqtt_acl TO ${EMQX_ROLE};
 
 -- Tables created above predate the ALTER DEFAULT PRIVILEGES only when this
 -- migration is re-run against an older database; granting explicitly is

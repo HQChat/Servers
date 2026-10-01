@@ -44,7 +44,7 @@ COPY . .
 # server. It is listed in compose ahead of server.env, so the host overrides it.
 # It is explicitly not a place for secrets: anyone who can pull the image can
 # read it.
-COPY --from=deploy docker-compose.yml docker-compose.preprod.yml nginx.conf release.env /deploy-bundle/
+COPY --from=deploy docker-compose.yml docker-compose.preprod.yml docker-compose.remote-broker.yml nginx.conf release.env /deploy-bundle/
 COPY --from=deploy emqx/ /deploy-bundle/emqx/
 COPY --from=deploy scripts/gen-runtime-secrets.sh scripts/hqcat-apply-nginx /deploy-bundle/scripts/
 COPY --from=deploy agent/ /deploy-bundle/agent/

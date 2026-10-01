@@ -1,4 +1,6 @@
-// The conversation-topic hash.
+// The friendship hash — what `/report` names a conversation by. It was the
+// conversation TOPIC until topics became random per-friendship ids
+// (009_friendship_topics.sql); the value itself is unchanged.
 //
 // ⚠️ This file passed UNCHANGED across the move from public keys to client ids,
 // because its stand-ins were already 64 characters — `"a".repeat(64)` happens to
@@ -8,16 +10,15 @@
 //
 // It is re-asserted here deliberately, against the SHARED vector file, which is
 // what makes it a cross-implementation check rather than a self-consistency one.
-// The function has a Swift counterpart (`MQTTTopics.conversation`) and a SQL
+// The function has a Swift counterpart (`MQTTTopics.friendshipHash`) and a SQL
 // one (`pk_digest` over the sorted pair), and 001_schema.sql claimed for months
 // that a vector existed to hold the three together. It does now:
 // test/helpers/identity-vectors.json, asserted here, in
 // services/server/test/identity.test.ts (including against a live Postgres) and
 // in apps/apple/tests/PeerIDTests.swift.
 //
-// Getting this wrong does not fail loudly. The two members of a friendship
-// derive different topic names, subscribe to different topics, and never speak —
-// with no error anywhere, because MQTT drops a publish nobody is subscribed to.
+// Getting this wrong does not fail loudly: a report names a conversation the
+// server cannot find, and the reporter is told they are not in it.
 
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
@@ -28,7 +29,7 @@ import { peerId } from "../lib/identity";
 
 const V = JSON.parse(
   fs.readFileSync(path.join(__dirname, "helpers", "identity-vectors.json"), "utf8")
-) as { friendships: Array<{ a: string; b: string; hash: string; topic: string }> };
+) as { friendships: Array<{ a: string; b: string; hash: string }> };
 
 const ID_A = peerId("a".repeat(14474));
 const ID_B = peerId("b".repeat(14474));
@@ -41,7 +42,6 @@ test("friendshipHash matches the pinned cross-implementation vectors", () => {
   assert.ok(V.friendships.length >= 3);
   for (const f of V.friendships) {
     assert.equal(friendshipHash(f.a, f.b), f.hash);
-    assert.equal(`c/${f.hash}`, f.topic);
   }
 });
 
@@ -67,8 +67,3 @@ test("it is fed CLIENT IDS, and the inputs are the width of one", () => {
   assert.equal(new Set([ID_A, ID_B, ID_C]).size, 3);
 });
 
-test("the resulting topic is 66 characters, not tens of thousands", () => {
-  // `c/{hash}` used to sit beside a 14474-character `pk` column in every
-  // mqtt_acl row, and inside the presence topics the same table stored.
-  assert.equal(`c/${friendshipHash(ID_A, ID_B)}`.length, 66);
-});

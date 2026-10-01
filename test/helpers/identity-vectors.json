@@ -1,5 +1,5 @@
 {
-  "_comment": "The client identifier id = sha256(lowercase-hex(publicKey)), and the conversation-topic hash friendshipHash(idA, idB) = sha256(sorted(a,b) joined). Asserted by services/server/test/identity.test.ts (which ALSO checks peerId against Postgres's pk_digest) and apps/apple/tests/PeerIDTests.swift, both of which READ this file. Regenerate with scripts/gen-identity-vectors.ts.",
+  "_comment": "The client identifier id = sha256(lowercase-hex(publicKey)), and the friendship hash friendshipHash(idA, idB) = sha256(sorted(a,b) joined) that /report names a conversation by (no longer a topic: conversations are addressed by random per-friendship ids). Asserted by services/server/test/identity.test.ts (which ALSO checks peerId against Postgres's pk_digest) and apps/apple/tests/PeerIDTests.swift, both of which READ this file. Regenerate with scripts/gen-identity-vectors.ts.",
   "version": 1,
   "publicKeyBytes": 7237,
   "keys": [
@@ -28,20 +28,17 @@
     {
       "a": "f25f33617a50eb83c2d695798e186e0ef2fb91018220e8383cf8577cc905e231",
       "b": "8006188126a94e9257510cd50cd90de9901e368d66c7b45ceb74c159efacf02b",
-      "hash": "3b797a5684eb156dfa019b7d4bb48c8d31fb65da41cf9899f0f76231ff91c5b3",
-      "topic": "c/3b797a5684eb156dfa019b7d4bb48c8d31fb65da41cf9899f0f76231ff91c5b3"
+      "hash": "3b797a5684eb156dfa019b7d4bb48c8d31fb65da41cf9899f0f76231ff91c5b3"
     },
     {
       "a": "8006188126a94e9257510cd50cd90de9901e368d66c7b45ceb74c159efacf02b",
       "b": "f25f33617a50eb83c2d695798e186e0ef2fb91018220e8383cf8577cc905e231",
-      "hash": "3b797a5684eb156dfa019b7d4bb48c8d31fb65da41cf9899f0f76231ff91c5b3",
-      "topic": "c/3b797a5684eb156dfa019b7d4bb48c8d31fb65da41cf9899f0f76231ff91c5b3"
+      "hash": "3b797a5684eb156dfa019b7d4bb48c8d31fb65da41cf9899f0f76231ff91c5b3"
     },
     {
       "a": "0000000000000000000000000000000000000000000000000000000000000000",
       "b": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-      "hash": "e2bd2dcef148b54e935fe552c7c83978103f85b2d970d55f482717bb3904b7ac",
-      "topic": "c/e2bd2dcef148b54e935fe552c7c83978103f85b2d970d55f482717bb3904b7ac"
+      "hash": "e2bd2dcef148b54e935fe552c7c83978103f85b2d970d55f482717bb3904b7ac"
     }
   ]
 }

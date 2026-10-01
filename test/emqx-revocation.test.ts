@@ -3,10 +3,18 @@
 // ── The failure ──────────────────────────────────────────────────────────────
 //
 // `lib/emqx.ts` exists so that revocation ACTS instead of waiting: deleting an
-// ACL row stops the NEXT authorization check, but EMQX checks authorization at
-// SUBSCRIBE, not per message, so an unfriended peer's already-open subscription
-// keeps delivering until they disconnect for their own reasons. The admin API
-// is what closes that window — `DELETE /clients/{id}/subscriptions/{topic}`.
+// ACL row stopped the NEXT authorization check (and a retired topic id stops
+// nobody who already holds it), so an unfriended peer's already-open
+// subscription keeps delivering until they disconnect for their own reasons. The
+// admin API is what closes that window — `POST /clients/{id}/unsubscribe`.
+//
+// ── The second failure ───────────────────────────────────────────────────────
+//
+// Once the URL fit, it still did not work: the call was `DELETE
+// /clients/{id}/subscriptions/{topic}`, a route EMQX 5.8 does not have. The
+// broker answered with an HTML 404, the client read a 404 as "already gone",
+// and every unfriend reported success. Asserted below: the request is the POST
+// the broker serves, and a bare 404 is NOT success.
 //
 // Both path segments were public keys. A client id was 14474 characters and a
 // conversation topic embedded a hash of two more, so the request line ran to
@@ -57,6 +65,8 @@ const SAFE_URL_LENGTH = 2048;
 const seen: string[] = [];
 
 const bodies: string[] = [];
+/** When set, the stand-in answers the next non-login request with this instead. */
+let override: { status: number; type: string; body: string } | null = null;
 let server: http.Server;
 let EMQX: typeof import("../lib/emqx").EMQX;
 
@@ -69,6 +79,12 @@ test("start a stand-in broker", async () => {
     req.on("data", (chunk) => { raw += chunk; });
     req.on("end", () => {
       if (raw) bodies.push(raw);
+      if (override && !req.url!.endsWith("/login")) {
+        const o = override;
+        override = null;
+        res.writeHead(o.status, { "content-type": o.type });
+        return res.end(o.body);
+      }
       res.writeHead(200, { "content-type": "application/json" });
       // Every admin call goes through `login` first, so the token has to be real
       // enough for the client to carry on.
@@ -96,24 +112,44 @@ test("unfriending drops ONE subscription, and the request fits in a URL", async 
   seen.length = 0;
   await EMQX.revokeTopic(a, b, topic);
 
-  const unsubscribes = seen.filter((line) => line.startsWith("DELETE"));
+  const unsubscribes = seen.filter((line) => line.startsWith("POST") && line.endsWith("/unsubscribe"));
   assert.equal(unsubscribes.length, 2, "one call per member of the friendship");
+  assert.ok(!seen.some((l) => l.startsWith("DELETE")), "no DELETE — EMQX 5.8 has no such subscription route");
 
   for (const line of unsubscribes) {
-    const url = line.slice("DELETE ".length);
-    // A SUBSCRIPTION endpoint, not a client one. Dropping the connection would
-    // also drop the peer's other conversations, which are none of our business —
-    // that trade was only ever forced by the URL not fitting.
-    assert.match(url, /^\/api\/v5\/clients\/[0-9a-f]{64}\/subscriptions\/.+$/,
-      "names one client and one topic");
+    const url = line.slice("POST ".length);
+    // An UNSUBSCRIBE, not a kick. Dropping the connection would also drop the
+    // peer's other conversations, which are none of our business.
+    assert.match(url, /^\/api\/v5\/clients\/[0-9a-f]{64}\/unsubscribe$/, "names one client");
     assert.ok(url.length < SAFE_URL_LENGTH,
       `the admin URL is ${url.length} characters, against a ${SAFE_URL_LENGTH} bound`);
-    assert.ok(url.includes(encodeURIComponent(topic)), "the topic is the one being revoked");
   }
+  // The topic travels in the body.
+  assert.equal(bodies.filter((b) => b.includes(JSON.stringify(topic))).length, 2,
+    "both bodies name the topic being revoked");
 
   // Both members, and only those two.
   assert.ok(unsubscribes.some((l) => l.includes(a)), "A's subscription is dropped");
   assert.ok(unsubscribes.some((l) => l.includes(b)), "B's subscription is dropped");
+});
+
+test("a 404 is success only when the broker says the client is not connected", async () => {
+  const id = peerId(crypto.randomBytes(HQC_PUBLIC_KEY_BYTES).toString("hex"));
+
+  // What EMQX answers for a route it does not have — which is what the old
+  // DELETE got, every time, and read as "already gone".
+  override = { status: 404, type: "text/html", body: "<html><h1>404 - NOT FOUND</h1></html>" };
+  assert.equal(await EMQX.unsubscribe(id, "cv/" + "1".repeat(64)), false,
+    "a missing route must not read as a dropped subscription");
+
+  // The client is simply not connected: nothing to drop.
+  override = { status: 404, type: "application/json",
+               body: JSON.stringify({ code: "CLIENTID_NOT_FOUND", message: "Client ID not found" }) };
+  assert.equal(await EMQX.unsubscribe(id, "cv/" + "1".repeat(64)), true);
+
+  // And the real success, a 204.
+  override = { status: 204, type: "application/json", body: "" };
+  assert.equal(await EMQX.unsubscribe(id, "cv/" + "1".repeat(64)), true);
 });
 
 test("the same call built from public keys would NOT have fit", async () => {

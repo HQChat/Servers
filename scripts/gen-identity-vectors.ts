@@ -88,7 +88,8 @@ console.log(
     {
       _comment:
         "The client identifier id = sha256(lowercase-hex(publicKey)), and the " +
-        "conversation-topic hash friendshipHash(idA, idB) = sha256(sorted(a,b) joined). " +
+        "friendship hash friendshipHash(idA, idB) = sha256(sorted(a,b) joined) that /report names a conversation by " +
+        "(no longer a topic: conversations are addressed by random per-friendship ids). " +
         "Asserted by services/server/test/identity.test.ts (which ALSO checks " +
         "peerId against Postgres's pk_digest) and apps/apple/tests/PeerIDTests.swift, " +
         "both of which READ this file. Regenerate with scripts/gen-identity-vectors.ts.",
@@ -98,7 +99,6 @@ console.log(
       friendships: friendships.map((f) => ({
         ...f,
         hash: friendshipHash(f.a, f.b),
-        topic: `c/${friendshipHash(f.a, f.b)}`,
       })),
     },
     null,

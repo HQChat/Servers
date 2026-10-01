@@ -10,15 +10,23 @@
 // from the `u/+/presence` wildcard (each replica sees all presence). The message
 // subscription is SHARED (`$share/…`) so replicas split the fan-in.
 //
+// Both are WILDCARD subscriptions, which the broker refuses to every ordinary
+// client (`mqtt.wildcard_subscription = false` — the setting that keeps anyone
+// from scraping `cv/+`). This bridge connects to the INTERNAL listener instead,
+// whose zone allows them and whose authentication admits only the internal
+// identity (infra/deploy/emqx/emqx.conf).
+//
 // ⚠️ This file PARSES topics, which makes it the one service that would keep
 // working while being wrong if the topic scheme changed under it. `{id}` here is
 // the client id — sha256(hex(pk)), 64 hex characters — and the `online` set,
-// `getHashMembers` and `ApnsService.send` are all keyed on that same value.
+// the members `getTopicMembers` returns and `ApnsService.send` are all keyed on
+// that same value. A conversation topic is `cv/{convo_id}`, the friendship's
+// random topic id, NOT anything derived from the members.
 // Extracting one form and looking up the other would produce a bridge that
 // never wakes anybody and never logs an error.
 //
 // It authenticates to EMQX with the privileged internal credential, which the
-// auth server's /mqtt/authn grants superuser (bypassing the per-topic ACL).
+// auth server's /mqtt/authn grants superuser (bypassing the static ACL).
 
 // Must be first: importing it loads .env + resolves *_FILE secrets before
 // anything reads env. `assertConfig` is called below, once the log sink is up.
@@ -31,6 +39,7 @@ import mqtt from "mqtt";
 import { DB } from "../services/db/api";
 import { ApnsService, keyProblem, type SendOutcome } from "../services/apns/api";
 import { apnsGaps, apnsIntended, apnsSummary } from "../lib/apns-config";
+import { listenOn, parseHosts } from "../lib/listen";
 
 // The one service that sends a push is the one that validates APNs. That used
 // to be nobody: `assertConfig` was called by auth and app-api — neither of which
@@ -59,7 +68,8 @@ if (apnsGaps(process.env).length && apnsIntended(process.env)) {
 }
 
 const PORT = Number(process.env.PORT || 8080);
-const EMQX_URL = process.env.EMQX_URL || "ws://emqx:8083/mqtt";
+// The internal listener, not the public WS one: see the header.
+const EMQX_URL = process.env.EMQX_URL || "mqtt://emqx:1884";
 const INTERNAL_MQTT_USER = process.env.INTERNAL_MQTT_USER || "svc-internal";
 const INTERNAL_MQTT_SECRET = process.env.INTERNAL_MQTT_SECRET || "";
 const SHARE_GROUP = process.env.PUSH_SHARE_GROUP || "pushbridge";
@@ -82,7 +92,7 @@ const online = new Set<string>();
  * `ApnsService`, wired below.
  */
 export interface PushDeps {
-  getHashMembers: (hash: string) => Promise<string[]>;
+  getTopicMembers: (convoId: string) => Promise<string[]>;
   send: (id: string, title: string, body: string) => Promise<SendOutcome>;
 }
 
@@ -104,21 +114,20 @@ export function createPushBridge(deps: PushDeps, presence: Set<string> = new Set
         return;
       }
 
-      // Conversation message: c/{hash} → wake offline members.
-      const convo = topic.match(/^c\/([0-9a-f]{64})$/);
+      // Conversation message: cv/{convo_id} → wake offline members.
+      const convo = topic.match(/^cv\/([0-9a-f]{64})$/);
       if (convo && convo[1]) {
-        const hash = convo[1];
+        const convoId = convo[1];
         // Ids, same as `presence` holds and same as ApnsService keys tokens on.
-        const members = await deps.getHashMembers(hash);
+        const members = await deps.getTopicMembers(convoId);
         if (members.length === 0) {
-          // The bridge parses a topic the broker authorized, so an unknown hash
-          // means the friendship row and the topic scheme disagree — the exact
-          // silent-and-wrong failure this file's header warns about. Once per
-          // hash: it would otherwise repeat for every message in a conversation
-          // that is going to keep having them.
-          sayOnce(`hash:${hash}`,
-                  `[push-bridge] no friendship row for ${short(hash)} — nobody to wake. ` +
-                  `The topic scheme and friendships.hash disagree.`);
+          // An id no friendship holds. Unlike the old derived topics this is not
+          // necessarily a bug: an ex-friend still knows a retired id and may
+          // publish to it, and nobody should be woken for that. Once per id, so
+          // a persistent one does not repeat per message.
+          sayOnce(`convo:${convoId}`,
+                  `[push-bridge] no friendship holds ${short(convoId)} — nobody to wake ` +
+                  `(a retired topic, or friendships.convo_id and the client disagree).`);
           return;
         }
         for (const id of members) {
@@ -160,7 +169,7 @@ export function createPushBridge(deps: PushDeps, presence: Set<string> = new Set
 export function pushSubscriptions(shareGroup: string = SHARE_GROUP): Array<{ topic: string; qos: 0 | 1 }> {
   return [
     { topic: "u/+/presence", qos: 0 },
-    { topic: `$share/${shareGroup}/c/+`, qos: 1 },
+    { topic: `$share/${shareGroup}/cv/+`, qos: 1 },
   ];
 }
 
@@ -192,12 +201,12 @@ function bootPushBridge(): void {
   if (keyIssue) logger.error(`[push-bridge] ${keyIssue}`);
 
   const bridge = createPushBridge({
-    getHashMembers: (hash) => DB.getHashMembers(hash),
+    getTopicMembers: (convoId) => DB.getTopicMembers(convoId),
     send: (id, title, body) => ApnsService.send(id, title, body),
   }, online);
 
-  http.createServer(createHealthHandler(online))
-    .listen(PORT, () => logger.startup(`📨 push-bridge health on :${PORT}`));
+  listenOn(() => http.createServer(createHealthHandler(online)), PORT, parseHosts(process.env.LISTEN_HOST),
+    (host) => logger.startup(`📨 push-bridge health on ${host}:${PORT}`));
 
   // Event-loop / memory / query-latency early warning → Sentry. A stalled bridge
   // silently stops waking offline devices, so it needs the same watch as the relay.

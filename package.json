@@ -13,9 +13,7 @@
     "test:e2e": "node --import tsx --test --test-force-exit test/e2e/mqtt.test.ts test/e2e/hqn.test.ts",
     "noise-gw": "tsx noise-gw/main.ts",
     "migrate": "tsx services/db/migrate.ts",
-    "check-mqtt-acl": "tsx scripts/check-mqtt-acl.ts",
     "check-push": "tsx scripts/check-push.ts",
-    "rebuild-mqtt-acl": "tsx scripts/rebuild-mqtt-acl.ts",
     "reports": "tsx scripts/reports.ts",
     "coverage": "mkdir -p coverage && node --import tsx --test --experimental-test-coverage --test-reporter=lcov --test-reporter-destination=coverage/lcov.info --test-reporter=spec --test-reporter-destination=stdout test/*.test.ts && tsx scripts/coverage-report.ts --lcov coverage/lcov.info --min-line 90 --min-reached 91",
     "mutation": "stryker run",
@@ -27,7 +25,7 @@
   },
   "license": "AGPL-3.0-only",
   "dependencies": {
-    "@sentry/node": "^8.55.2",
+    "@sentry/node": "^10.75.3",
     "dotenv": "^17.2.3",
     "koffi": "^2.15.0",
     "mqtt": "^5.15.2",
@@ -44,5 +42,8 @@
     "@types/ref-napi": "^3.0.12",
     "@types/ws": "^8.18.1",
     "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "qs": "^6.16.0"
   }
 }

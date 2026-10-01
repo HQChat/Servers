@@ -12,9 +12,8 @@
 //
 // That is a SHAPE CONTRACT with a piece of software this repo does not build,
 // and the only thing that can hold it is a test that encodes both shapes. The
-// consequence of it breaking is not a quiet gap: with `no_match = deny` and
-// `deny_action = disconnect`, a dead authorizer drops every client that touches
-// a topic, and the watchdog that exists to say so is the thing that crashed.
+// consequence of it breaking is not a quiet gap: the watchdog that exists to
+// say the ACL is wrong is the thing that crashed.
 //
 // `fetch` is stubbed, so nothing reaches a broker. `services/db/pg` is stubbed,
 // so nothing reaches a database.
@@ -96,8 +95,10 @@ function healthy() {
       { mechanism: "password_based", backend: "http", enable: true, status: "connected" },
     ]),
     "authorization/sources": reply(200, {
-      sources: [{ type: "postgresql", enable: true, status: "connected" }],
+      sources: [{ type: "file", enable: true, status: "connected" }],
     }),
+    "authorization/settings": reply(200, { no_match: "deny", deny_action: "ignore", cache: { enable: false } }),
+    "configs/global_zone": reply(200, { mqtt: { wildcard_subscription: false } }),
   };
 }
 
@@ -113,7 +114,7 @@ test("the authorization sources are read out of their wrapper", async () => {
   // `/authentication` answers a bare array — two endpoints on the same API with
   // two shapes.
   const checks = await bw.checkEmqx();
-  const authz = byName(checks, "emqx.authz.postgresql");
+  const authz = byName(checks, "emqx.authz.file");
   assert.ok(authz, `no authz check produced; got ${checks.map((c) => c.name).join(", ")}`);
   assert.equal(authz!.ok, true);
 });
@@ -122,7 +123,7 @@ test("a bare array from that endpoint is not silently accepted", async () => {
   // If EMQX ever unwraps it, the destructure yields undefined and defaults to
   // `[]` — which must read as "no authorization source configured", the loudest
   // check in the file, rather than as nothing at all.
-  routes["authorization/sources"] = reply(200, [{ type: "postgresql", enable: true, status: "connected" }]);
+  routes["authorization/sources"] = reply(200, [{ type: "file", enable: true, status: "connected" }]);
   const checks = await bw.checkEmqx();
   const authz = byName(checks, "emqx.authz");
   assert.ok(authz, "an unexpected shape must produce a check, not vanish");
@@ -182,6 +183,51 @@ test("a disconnected authorizer is reported unhealthy with its reason", async ()
   const authz = byName(await bw.checkEmqx(), "emqx.authz.postgresql")!;
   assert.equal(authz.ok, false);
   assert.match(authz.detail, /econnrefused/, "the reason is the whole diagnosis");
+});
+
+// --- the settings the static ACL rests on ---------------------------------------------
+
+test("a healthy broker reports wildcards off and no_match = deny", async () => {
+  const checks = await bw.checkEmqx();
+  assert.equal(byName(checks, "emqx.wildcard_subscription")!.ok, true);
+  assert.equal(byName(checks, "emqx.authz.no_match")!.ok, true);
+  assert.equal(byName(checks, "emqx.authz"), undefined, "a loaded file source raises no source alarm");
+  assert.ok(checks.every((c) => c.ok), JSON.stringify(checks.filter((c) => !c.ok)));
+});
+
+test("wildcards ON is an alarm — it is the whole of the conversation ACL", async () => {
+  // acl.conf allows `cv/+` to everyone. With wildcards on, a client filter
+  // `cv/#` matches that rule and receives every conversation on the broker.
+  routes["configs/global_zone"] = reply(200, { mqtt: { wildcard_subscription: true } });
+  const c = byName(await bw.checkEmqx(), "emqx.wildcard_subscription")!;
+  assert.equal(c.ok, false);
+  assert.match(c.detail, /read every conversation/);
+});
+
+test("an unreadable wildcard setting is an alarm, not a pass", async () => {
+  // Missing is not false. A broker whose API stopped answering this path has
+  // stopped proving the one thing that matters.
+  routes["configs/global_zone"] = reply(200, { mqtt: {} });
+  assert.equal(byName(await bw.checkEmqx(), "emqx.wildcard_subscription")!.ok, false);
+  delete routes["configs/global_zone"];
+  const checks = await bw.checkEmqx();
+  assert.equal(byName(checks, "emqx.wildcard_subscription")!.ok, false);
+  assert.ok(byName(checks, "emqx.node.emqx@node1"), "one unanswered path must not sink the other checks");
+});
+
+test("no_match = allow is an alarm — it makes every rule moot", async () => {
+  routes["authorization/settings"] = reply(200, { no_match: "allow" });
+  assert.equal(byName(await bw.checkEmqx(), "emqx.authz.no_match")!.ok, false);
+});
+
+test("a broker enforcing something other than the file ACL is an alarm", async () => {
+  // e.g. an old config that still names the Postgres source, and no file one.
+  routes["authorization/sources"] = reply(200, {
+    sources: [{ type: "postgresql", enable: true, status: "connected" }],
+  });
+  const c = byName(await bw.checkEmqx(), "emqx.authz")!;
+  assert.equal(c.ok, false);
+  assert.match(c.detail, /static file ACL is not loaded/);
 });
 
 // --- the nodes ------------------------------------------------------------------------

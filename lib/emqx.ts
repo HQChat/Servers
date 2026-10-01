@@ -12,53 +12,18 @@
 //
 // Every call here is BEST EFFORT. A failed kick must never fail the user-facing
 // operation that triggered it (you unfriended someone; that must succeed even if
-// the broker is unreachable) — it is logged and surfaced, and the ACL edit still
-// stands, so the next authorization check refuses them anyway.
+// the broker is unreachable) — it is logged and surfaced. For a friendship the
+// deleted row still stands: the topic ids it held are never handed out or
+// published to again, so a subscription this failed to drop goes quiet.
 
 import { logger } from "./logger";
-
-const API = `${process.env.EMQX_API_URL || "http://emqx:18083"}/api/v5`;
-const USER = process.env.EMQX_DASHBOARD_USER || "admin";
-const PASS = process.env.EMQX_DASHBOARD_PASSWORD || "";
-
-let token: string | null = null;
-
-async function login(): Promise<string> {
-  const res = await fetch(`${API}/login`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ username: USER, password: PASS }),
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!res.ok) throw new Error(`emqx login ${res.status}`);
-  const body = (await res.json()) as { token?: string };
-  if (!body.token) throw new Error("emqx login returned no token");
-  return body.token;
-}
-
-/** One admin call, re-authenticating once on 401 so an expired token self-heals. */
-async function call(method: string, path: string, body?: unknown, retry = true): Promise<Response> {
-  if (!token) token = await login();
-  const res = await fetch(`${API}/${path}`, {
-    method,
-    headers: {
-      authorization: `Bearer ${token}`,
-      ...(body === undefined ? {} : { "content-type": "application/json" }),
-    },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    signal: AbortSignal.timeout(5000),
-  });
-  if (res.status === 401 && retry) {
-    token = null;
-    return call(method, path, body, false);
-  }
-  return res;
-}
+import { conversationTopic, handshakeTopic } from "./topics";
+import { emqxApi as call, emqxApiConfigured } from "./emqx-api";
 
 export const EMQX = {
   /** True when an admin credential is configured at all. */
   get enabled(): boolean {
-    return PASS.length > 0;
+    return emqxApiConfigured();
   },
 
   /**
@@ -84,18 +49,31 @@ export const EMQX = {
 
   /**
    * Drop ONE live subscription, leaving the connection and every other
-   * conversation intact. This is the unfriend path: the ACL edit blocks the next
-   * authorization check, and this stops the delivery already in flight.
+   * conversation intact. This is the unfriend path: the friendship row's
+   * deletion retires the topic, and this stops the delivery already in flight.
+   *
+   * `POST /clients/{id}/unsubscribe` with the topic in the body. It used to be
+   * `DELETE /clients/{id}/subscriptions/{topic}` — a route EMQX 5.8 does not
+   * have. The broker answered with its generic HTML 404, and a 404 was read as
+   * "already gone", so every unfriend reported success while the ex-friend's
+   * subscription kept delivering. Found by the e2e unfriend test once it
+   * checked delivery rather than a decrypted-message count.
+   *
+   * So a 404 counts as done ONLY when the broker says the CLIENT is not
+   * connected (`CLIENTID_NOT_FOUND`) — there is then nothing to drop, and its
+   * next CONNECT resubscribes only to what its directory still names.
    */
   async unsubscribe(clientId: string, topic: string): Promise<boolean> {
     if (!EMQX.enabled) return false;
     try {
-      const res = await call(
-        "DELETE",
-        `clients/${encodeURIComponent(clientId)}/subscriptions/${encodeURIComponent(topic)}`
-      );
-      if (res.ok || res.status === 404) return true;
-      logger.warn(`[emqx] unsubscribe ${clientId.slice(0, 12)}… from ${topic} → ${res.status}`);
+      const res = await call("POST", `clients/${encodeURIComponent(clientId)}/unsubscribe`, { topic });
+      if (res.ok) return true;
+      if (res.status === 404) {
+        const body = (await res.json().catch(() => null)) as { code?: string } | null;
+        if (body?.code === "CLIENTID_NOT_FOUND") return true;
+      }
+      // The topic is a capability: log its kind, never its id.
+      logger.warn(`[emqx] unsubscribe ${clientId.slice(0, 12)}… from ${topic.slice(0, 3)}… → ${res.status}`);
       return false;
     } catch (e) {
       logger.error(`[emqx] unsubscribe failed: ${(e as Error).message}`);
@@ -106,6 +84,20 @@ export const EMQX = {
   /** Both members of a friendship, off the shared topic. */
   async revokeTopic(pkA: string, pkB: string, topic: string): Promise<void> {
     await Promise.all([EMQX.unsubscribe(pkA, topic), EMQX.unsubscribe(pkB, topic)]);
+  },
+
+  /** Both members off BOTH of an ended friendship's topics. The handshake topic
+   *  matters as much as the conversation: it is where an `init` is proven, so an
+   *  ex-friend left on it could keep answering challenges. */
+  async revokeFriendshipTopics(
+    idA: string,
+    idB: string,
+    topics: { convoId: string; handshakeId: string }
+  ): Promise<void> {
+    await Promise.all([
+      EMQX.revokeTopic(idA, idB, conversationTopic(topics.convoId)),
+      EMQX.revokeTopic(idA, idB, handshakeTopic(topics.handshakeId)),
+    ]);
   },
 
   /**

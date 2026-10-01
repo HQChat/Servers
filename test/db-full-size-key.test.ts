@@ -129,24 +129,6 @@ test("the identity, graph and ACL tables are keyed by a 64-character id", async 
   assert.ok(await DB.acceptInvite(`big_a2_${id}`, b));
   assert.ok(await DB.checkFriendship(a, b), "friendship pair key");
 
-  await DB.grantSelfTopics(a);
-  await DB.grantFriendTopic(a, b);
-  const topics = await DB.getAclTopics(a);
-  assert.ok(topics.length >= 3);
-
-  // The row size that made every per-client EMQX admin call answer 414. A
-  // presence topic embedded a whole public key, beside a `pk` column holding
-  // another one: ~29 kB to record one membership bit.
-  // `u/` + 64 + `/presence` is the longest topic the scheme can produce.
-  const widest = Math.max(...topics.map((tp) => tp.length));
-  assert.equal(widest, 2 + 64 + "/presence".length, `the widest topic is ${widest} characters`);
-  const { rows } = await q<{ bytes: string }>(
-    `SELECT sum(octet_length(id) + octet_length(topic) + octet_length(action))::text AS bytes
-       FROM mqtt_acl WHERE id = $1`, [a]
-  );
-  const bytes = Number(rows[0]!.bytes);
-  assert.ok(bytes < 1000, `${topics.length} ACL rows total ${bytes} bytes, not ~29 kB each`);
-
   await DB.deleteUser(a);
   await DB.deleteUser(b);
 });

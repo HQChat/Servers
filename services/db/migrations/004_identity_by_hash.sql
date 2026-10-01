@@ -199,8 +199,6 @@ CREATE TABLE mqtt_acl (
   PRIMARY KEY (id, topic)
 );
 
--- The one table the broker's role may read (see 000_roles.sql).
-GRANT SELECT ON mqtt_acl TO ${EMQX_ROLE};
 
 -- ============================================================
 -- 9. PREKEYS

@@ -3,14 +3,14 @@
 // WHY THIS EXISTS. Every Node service reports itself to Sentry (lib/observability
 // .ts) — but two things in the stack are NOT Node and reported NOTHING:
 //
-//   1. EMQX's own connections. The broker keeps its OWN Postgres link (the
-//      topic-ACL authorizer, with its own credentials and its own pool) and its
-//      own HTTP link to the auth server. Either can be flat on its back while
-//      every app service's database client is perfectly healthy, so nothing in
-//      Sentry moves and the dashboard is the only place the failure is visible —
-//      and only if someone opens it. A dead authorizer means the ACL never
-//      matches, which with `no_match = deny` + `deny_action = disconnect` drops
-//      every client that tries a topic. An incident either way.
+//   1. EMQX's own state. The broker keeps its own HTTP link to the auth server,
+//      which can be flat on its back while every app service is healthy — and
+//      then NOBODY connects. And its authorization is a static file plus one
+//      setting, `mqtt.wildcard_subscription = false`, that the whole ACL rests
+//      on: acl.conf allows `cv/+` to everyone because a conversation id is a
+//      secret, so a broker that booted with wildcards ON — a config edit, a
+//      lost mount, the image's stock defaults — lets any client subscribe to
+//      `cv/#` and read every conversation. Nothing else would ever notice.
 //   2. Postgres itself. Services log their own client errors, but a database
 //      that is up yet not answering (a maintenance restart, a saturated
 //      connection pool, credentials that drifted) shows up as scattered noise
@@ -28,57 +28,29 @@ import { logger } from "../lib/logger";
 import { healthMonitor } from "../lib/health-monitor";
 import * as http from "http";
 import { ping, sweepExpired } from "../services/db/pg";
+import { emqxApi, emqxApiConfigured, resetEmqxApiToken } from "../lib/emqx-api";
+import { listenOn, parseHosts } from "../lib/listen";
 
 const PORT = Number(process.env.PORT || 8080);
 const INTERVAL_MS = Number(process.env.BROKER_WATCH_INTERVAL_MS || 30_000);
 const REALERT_MS = Number(process.env.BROKER_WATCH_REALERT_MS || 30 * 60_000);
-const API = `${process.env.EMQX_API_URL || "http://emqx:18083"}/api/v5`;
-const DASH_USER = process.env.EMQX_DASHBOARD_USER || "admin";
-// Resolved from EMQX_DASHBOARD_PASSWORD_FILE (the runtime-secrets tmpfs) by config.ts.
-const DASH_PASS = process.env.EMQX_DASHBOARD_PASSWORD || "";
-
 export interface Check {
   name: string;
   ok: boolean;
   detail: string;
 }
 
-// --- EMQX dashboard API ------------------------------------------------------
-// The dashboard admin credential is the API credential; the emqx entrypoint
-// re-syncs it to the generated secret on every boot, so it never drifts.
-let token: string | null = null;
+// --- EMQX admin API ------------------------------------------------------------
+// API key when configured, else the dashboard login (lib/emqx-api.ts).
 
-/** Drop the cached dashboard token. Exported for tests: the 401 self-heal in
- *  `api()` is a property of the transition from a stale token to a fresh one,
- *  and `token` is module state with no other way back to null. */
+/** Drop the cached dashboard token. Exported for tests. */
 export function resetApiToken(): void {
-  token = null;
+  resetEmqxApiToken();
 }
 
-async function login(): Promise<string> {
-  const res = await fetch(`${API}/login`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ username: DASH_USER, password: DASH_PASS }),
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!res.ok) throw new Error(`login ${res.status}`);
-  const body = (await res.json()) as { token?: string };
-  if (!body.token) throw new Error("login returned no token");
-  return body.token;
-}
-
-/** GET an API path, logging in (once) on 401 so an expired token self-heals. */
-async function api<T>(path: string, retry = true): Promise<T> {
-  if (!token) token = await login();
-  const res = await fetch(`${API}/${path}`, {
-    headers: { authorization: `Bearer ${token}` },
-    signal: AbortSignal.timeout(5000),
-  });
-  if (res.status === 401 && retry) {
-    token = null;
-    return api<T>(path, false);
-  }
+/** GET an API path. */
+async function api<T>(path: string): Promise<T> {
+  const res = await emqxApi("GET", path);
   if (!res.ok) throw new Error(`GET ${path} → ${res.status}`);
   return (await res.json()) as T;
 }
@@ -99,6 +71,16 @@ export function nodeErrors(x: { node_error?: unknown[] }): string {
   const errs = x.node_error || [];
   if (!errs.length) return "";
   return ` — ${errs.map((e) => (typeof e === "string" ? e : JSON.stringify(e))).join("; ").slice(0, 300)}`;
+}
+
+/** One check that cannot take the others down with it: an API path this EMQX
+ *  version does not serve is a failing check, not an exception out of the poll. */
+async function probe(name: string, fn: () => Promise<{ ok: boolean; detail: string }>): Promise<Check> {
+  try {
+    return { name, ...(await fn()) };
+  } catch (e) {
+    return { name, ok: false, detail: (e as Error).message };
+  }
 }
 
 export async function checkEmqx(): Promise<Check[]> {
@@ -130,7 +112,7 @@ export async function checkEmqx(): Promise<Check[]> {
     });
   }
 
-  // Authorization sources — the per-conversation topic ACL (Postgres).
+  // Authorization sources — the static file ACL (infra/deploy/emqx/acl.conf).
   //
   // This one is NOT shaped like /authentication above, which really does answer
   // with a bare array. `GET /authorization/sources` wraps it:
@@ -139,12 +121,14 @@ export async function checkEmqx(): Promise<Check[]> {
   //     -- emqx_authz_api_sources.erl, v5.8.6, the version this stack pins
   //
   // Reading it as an array threw `authz is not iterable` on every poll, so the
-  // one check that exists to notice a broken topic ACL has never once reported
-  // on it -- it failed before it could look.
+  // one check that exists to notice a broken topic ACL never once reported on
+  // it -- it failed before it could look.
   type Authz = { type?: string; enable?: boolean; status?: string; node_error?: unknown[] };
   const { sources: authz = [] } = await api<{ sources?: Authz[] }>("authorization/sources");
   if (!authz.length) {
     out.push({ name: "emqx.authz", ok: false, detail: "no authorization source configured — the topic ACL is not enforced" });
+  } else if (!authz.some((s) => s.type === "file" && s.enable !== false)) {
+    out.push({ name: "emqx.authz", ok: false, detail: "the static file ACL is not loaded — acl.conf is not what is being enforced" });
   }
   for (const s of authz) {
     out.push({
@@ -153,6 +137,25 @@ export async function checkEmqx(): Promise<Check[]> {
       detail: `status=${s.status ?? "n/a"} enable=${s.enable}${nodeErrors(s)}`,
     });
   }
+
+  // What happens to a topic nothing allows. `allow` would make every rule in
+  // acl.conf moot.
+  out.push(await probe("emqx.authz.no_match", async () => {
+    const { no_match } = await api<{ no_match?: string }>("authorization/settings");
+    return { ok: no_match === "deny", detail: `no_match=${no_match ?? "n/a"}` };
+  }));
+
+  // The setting the ACL rests on. See this file's header.
+  out.push(await probe("emqx.wildcard_subscription", async () => {
+    const zone = await api<{ mqtt?: { wildcard_subscription?: boolean } }>("configs/global_zone");
+    const on = zone.mqtt?.wildcard_subscription;
+    return {
+      ok: on === false,
+      detail: on === false
+        ? "off for clients"
+        : `wildcard_subscription=${on} — any client can subscribe to cv/# and read every conversation`,
+    };
+  }));
 
   return out;
 }
@@ -262,7 +265,7 @@ export async function tick(): Promise<void> {
     checks.push(...(await checkEmqx()));
   } catch (e) {
     // The API itself is unreachable/unauthorised — that IS the alert.
-    token = null;
+    resetEmqxApiToken();
     checks.push({ name: "emqx.api", ok: false, detail: (e as Error).message });
   }
   for (const c of checks) escalate(c);
@@ -299,11 +302,11 @@ export function createStatusHandler(): http.RequestListener {
 if (require.main === module) {
   initObservability("broker-watch");
 
-  http.createServer(createStatusHandler())
-    .listen(PORT, () => logger.startup(`🛎️  broker-watch health on :${PORT} — polling every ${INTERVAL_MS}ms`));
+  listenOn(() => http.createServer(createStatusHandler()), PORT, parseHosts(process.env.LISTEN_HOST),
+    (host) => logger.startup(`🛎️  broker-watch health on ${host}:${PORT} — polling every ${INTERVAL_MS}ms`));
 
-  if (!DASH_PASS) {
-    logger.error("[broker-watch] EMQX_DASHBOARD_PASSWORD unset — cannot query the broker API");
+  if (!emqxApiConfigured()) {
+    logger.error("[broker-watch] no EMQX API credential (EMQX_API_KEY/SECRET or EMQX_DASHBOARD_PASSWORD) — cannot query the broker API");
   }
 
   // Event-loop/memory early warning for this process too.

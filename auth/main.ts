@@ -57,6 +57,7 @@ import {
 import { checkAdmission, type Door } from "../lib/admission";
 import { peerId } from "../lib/identity";
 import { DB, type SessionScope } from "../services/db/api";
+import { listenOn, parseHosts } from "../lib/listen";
 
 const PORT = Number(process.env.PORT || 8080);
 
@@ -102,11 +103,9 @@ async function ensureBotFriendship(id: string): Promise<void> {
   try {
     const botId = await DB.getIdByUsername(BOT_USERNAME);
     if (!botId || botId === id) return; // bot not registered yet, or this IS the bot
+    // The row is the whole friendship: its topic ids are minted by the column
+    // default and reach both sides through /friends.
     if (!(await DB.areFriends(id, botId))) await DB.createFriendship(id, botId);
-    // The friend sets alone are invisible to MQTT — the ACL entry is what lets
-    // either side use the shared topic, and it records the members push-bridge
-    // resolves. Idempotent, so re-running it per login is harmless.
-    await DB.grantFriendTopic(id, botId);
   } catch (e) {
     logger.warn(`[auth] helper-bot auto-friend failed for ${id.slice(0, 12)}…: ${(e as Error).message}`);
   }
@@ -294,16 +293,9 @@ async function handleVerify(req: http.IncomingMessage, res: http.ServerResponse,
   // change, because `users.pk` was identity and key material at once.
   await DB.ensureUser(id, pkHex);
 
-  // Self topics (presence publish + inbox) and the helper bot are what the FREE
-  // tier is: a new account already lands here, so the free door needs no ACL
-  // work of its own — only the absence of friend grants.
-  await DB.grantSelfTopics(id);
+  // No topic grants: the broker's ACL is static (infra/deploy/emqx/acl.conf)
+  // and keys the per-user topics on the authenticated clientid.
   await ensureBotFriendship(id);
-  if (scope === "premium") {
-    // Restore whatever a lapse revoked. Idempotent, so paying users pay no
-    // attention to it; a resubscriber gets their conversations back on login.
-    await DB.regrantAllFriendTopics(id);
-  }
 
   const username = await DB.getUsername(id);
   const sessionToken = await DB.mintSessionToken(id, scope);
@@ -384,9 +376,9 @@ export function createAuthHandler(): http.RequestListener {
     }
 
     // --- 4. EMQX HTTP authentication hook ------------------------------------
-    // EMQX posts { username, password, clientid } on every CONNECT.
-    // Internal services present the privileged credential → superuser. Everyone
-    // else: username = the CLIENT ID (sha256 of the hex public key), password =
+    // EMQX posts { username, password, clientid } on every CONNECT to the
+    // public listeners. Never a superuser here (see /mqtt/authn/internal).
+    // username = the CLIENT ID (sha256 of the hex public key), password =
     // the opaque token; we verify it and hand EMQX the token's `expire_at` so
     // EMQX DISCONNECTS the client at expiry → the client refreshes and
     // reconnects (expiration-based rotation). A v1 password is instead a signed,
@@ -394,26 +386,31 @@ export function createAuthHandler(): http.RequestListener {
     // EMQX expects HTTP 200 with { result: "allow"|"deny", is_superuser?, expire_at? }.
     //
     // The username used to be the whole 14474-character public key, which the
-    // broker also carried as the clientid on every CONNECT packet — and which
-    // the authorizer then compared against a 14 kB column. Both are 64
-    // characters now, and `authorization.sources[].query` in emqx.conf reads
-    // `WHERE id = ${clientid}` to match. The two MUST change together: an
-    // authorizer whose query names a column that no longer exists errors on
-    // every lookup, and with `deny_action = disconnect` that is every client in
-    // a connect/drop loop.
+    // broker also carried as the clientid on every CONNECT packet. Both are 64
+    // characters now, and the static ACL (acl.conf) interpolates ${clientid}
+    // into the per-user topics.
+    // The INTERNAL listener's hook (emqx.conf `listeners.tcp.internal`): the
+    // privileged identity, and nobody else. That listener's zone allows wildcard
+    // subscriptions — the push-bridge needs `u/+/presence` and
+    // `$share/…/cv/+` — so an ordinary client admitted there could scrape every
+    // conversation. The public hook below, conversely, never grants superuser:
+    // a leaked internal secret presented on the public WS listener is refused
+    // rather than handed a session that bypasses the ACL.
+    if (method === "POST" && url === "/mqtt/authn/internal") {
+      const body = await readJson(req);
+      const username = String(body.username || "");
+      const password = String(body.password || "");
+      const ok =
+        !!INTERNAL_MQTT_SECRET &&
+        username === INTERNAL_MQTT_USER &&
+        safeEqualStr(password, INTERNAL_MQTT_SECRET);
+      return send(res, 200, ok ? { result: "allow", is_superuser: true } : { result: "deny" });
+    }
+
     if (method === "POST" && url === "/mqtt/authn") {
       const body = await readJson(req);
       const username = String(body.username || "");
       const password = String(body.password || "");
-
-      // Privileged internal identity (push-bridge, ops tools). No expiry.
-      if (
-        INTERNAL_MQTT_SECRET &&
-        username === INTERNAL_MQTT_USER &&
-        safeEqualStr(password, INTERNAL_MQTT_SECRET)
-      ) {
-        return send(res, 200, { result: "allow", is_superuser: true });
-      }
 
       const id = username.toLowerCase();
       if (!id || !password) return send(res, 200, { result: "deny" });
@@ -437,10 +434,10 @@ export function createAuthHandler(): http.RequestListener {
       if (!ok) return send(res, 200, { result: "deny" });
 
       // The token proves who the USERNAME is; the broker authorizes by the
-      // CLIENTID (`mqtt_acl WHERE id = ${clientid}`, emqx.conf). Unless the two
-      // are the same id, any client holding a token of its own could CONNECT as
-      // `clientid = <victim>`, inherit the victim's topic grants, and take over
-      // — kick — the victim's live session. Exact match against the lowercased
+      // CLIENTID (`u/${clientid}/…` in acl.conf). Unless the two are the same
+      // id, any client holding a token of its own could CONNECT as
+      // `clientid = <victim>`, subscribe to the victim's inbox, publish the
+      // victim's presence, and take over — kick — the victim's live session. Exact match against the lowercased
       // username: an upper-cased clientid would match no ACL row anyway, and
       // accepting it would only make the id mean two things. Checked after the
       // token, so the warning names a real token holder trying it, not noise.
@@ -477,8 +474,10 @@ export function createAuthHandler(): http.RequestListener {
 // refusing boot without a mail credential, has nothing left to protect.
 if (require.main === module) {
   initObservability("auth");
-  http.createServer(createAuthHandler()).listen(PORT, () => {
-    logger.startup(`🔐 auth server on :${PORT} — /auth/{free,paid}/*, EMQX hook /mqtt/authn`);
+  // LISTEN_HOST: loopback for nginx plus the WireGuard address for the broker's
+  // hooks, off Docker. Unset = every interface (compose).
+  listenOn(() => http.createServer(createAuthHandler()), PORT, parseHosts(process.env.LISTEN_HOST), (host) => {
+    logger.startup(`🔐 auth server on ${host}:${PORT} — /auth/{free,paid}/*, EMQX hook /mqtt/authn`);
   });
 
   // Event-loop / memory / query-latency early warning → Sentry. This process

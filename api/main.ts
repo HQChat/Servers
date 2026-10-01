@@ -2,9 +2,10 @@
 //
 // "The monolith minus auth and messages": the HTTP/REST control plane for
 // directory, the friend graph, payments, push-token registration, and account
-// deletion. It NEVER sees message content. Friend-graph mutations here maintain
-// the MQTT topic ACL (DB.grantFriendTopic / DB.revokeFriendTopic) that EMQX
-// enforces as RLS.
+// deletion. It NEVER sees message content. A friendship's row carries its MQTT
+// topic ids (migrations/009_friendship_topics.sql); knowing them is the
+// broker's only check on a conversation (infra/deploy/emqx/acl.conf), so
+// /friends is where they are handed out and unfriending is where they die.
 //
 // Auth: every mutating route requires a REST session bearer (Authorization:
 // Bearer <sessionToken>) minted by the auth server after the HQC handshake and
@@ -28,11 +29,11 @@ import {
 } from "../lib/http";
 import { DB } from "../services/db/api";
 import { EMQX } from "../lib/emqx";
-import { friendshipHash } from "../lib/crypto-utils";
 import { isPeerId, PEER_ID_LENGTH } from "../lib/identity";
 import { StripeService, displayNameFromSession } from "../services/stripe/api";
 import { handleDonate } from "../services/web/donate";
 import { ADMISSION_POLICY } from "../lib/admission";
+import { listenOn, parseHosts } from "../lib/listen";
 
 const PORT = Number(process.env.PORT || 8080);
 
@@ -76,9 +77,8 @@ const MAX_PEER_IDENTIFIER = 128;
 // actually threatens the deployment is a script, not a popular account, and
 // these are set where no real person will ever meet them.
 //
-// The friend cap also bounds a real fan-out: `endPremiumAccess`-style ACL walks
-// and `notifyGraphChanged` are O(friends), and `regrantAllFriendTopics` runs on
-// every full-door login.
+// The friend cap also bounds a real fan-out: `notifyGraphChanged` and the
+// /friends payload are O(friends).
 const FRIEND_CAP = Number(process.env.FRIEND_CAP || 150);
 // Per calendar-ish day, on the existing `rate_counters` table — no new storage.
 const INVITES_PER_DAY = Number(process.env.INVITES_PER_DAY || 20);
@@ -197,580 +197,581 @@ async function authSession(req: http.IncomingMessage) {
  */
 export function createApiHandler(): http.RequestListener {
   return async (req, res) => {
-  const url = req.url || "";
-  const method = req.method || "GET";
-  try {
-    if (method === "GET" && url === "/health") {
-      return send(res, 200, { ok: true, service: "api" });
-    }
+    const url = req.url || "";
+    const method = req.method || "GET";
+    try {
+      if (method === "GET" && url === "/health") {
+        return send(res, 200, { ok: true, service: "api" });
+      }
 
-    // --- /info + /metrics -----------------------------------------------------
-    // Both lived on the retired monolith and, for a while, nowhere at all: the
-    // apps' server-info screen and any uptime monitor pointed at a 404. app-api
-    // is the natural host — it is the only public HTTP service left.
-    if (method === "GET" && url === "/info") {
-      return send(res, 200, {
-        name: process.env.SERVER_NAME || "hqchat",
-        version: process.env.SERVER_VERSION || "dev",
-        admission: ADMISSION_POLICY,
-        // What a client needs to decide whether it can talk to this deployment
-        // at all, without a round trip per capability.
-        transport: "mqtt",
-        endpoints: { auth: "/auth", mqtt: "/mqtt", api: "/" },
-        // Advisory, and advisory on purpose — it blocks nothing. A wire-version
-        // flip switches every contact at once, so it is done in a window, and
-        // this is what tells people the window is open. Gating during it would
-        // be the wrong instinct for a security reason: the window is exactly
-        // when a client most needs to reach the server, to receive the build the
-        // window exists for.
-        maintenance: {
-          active: MAINTENANCE_MESSAGE.length > 0,
-          message: MAINTENANCE_MESSAGE,
-        },
-      });
-    }
-    if (method === "GET" && url === "/metrics") {
-      // Fail closed in production: no token configured means no metrics, not
-      // open metrics (SRV-2). Localhost-only at the nginx layer as well.
-      const token = process.env.METRICS_TOKEN || "";
-      if (!token || bearer(req) !== token) return send(res, 404, { error: "not found" });
-      return send(res, 200, {
-        service: "api",
-        uptimeSec: Math.round(process.uptime()),
-        health: healthMonitor.getSnapshot(),
-      });
-    }
+      // --- /info + /metrics -----------------------------------------------------
+      // Both lived on the retired monolith and, for a while, nowhere at all: the
+      // apps' server-info screen and any uptime monitor pointed at a 404. app-api
+      // is the natural host — it is the only public HTTP service left.
+      if (method === "GET" && url === "/info") {
+        return send(res, 200, {
+          name: process.env.SERVER_NAME || "hqchat",
+          version: process.env.SERVER_VERSION || "dev",
+          admission: ADMISSION_POLICY,
+          // What a client needs to decide whether it can talk to this deployment
+          // at all, without a round trip per capability.
+          transport: "mqtt",
+          isGlobal: true,
+          endpoints: { auth: "/auth", mqtt: "/mqtt", api: "/" },
+          // Advisory, and advisory on purpose — it blocks nothing. A wire-version
+          // flip switches every contact at once, so it is done in a window, and
+          // this is what tells people the window is open. Gating during it would
+          // be the wrong instinct for a security reason: the window is exactly
+          // when a client most needs to reach the server, to receive the build the
+          // window exists for.
+          maintenance: {
+            active: MAINTENANCE_MESSAGE.length > 0,
+            message: MAINTENANCE_MESSAGE,
+          },
+        });
+      }
+      if (method === "GET" && url === "/metrics") {
+        // Fail closed in production: no token configured means no metrics, not
+        // open metrics (SRV-2). Localhost-only at the nginx layer as well.
+        const token = process.env.METRICS_TOKEN || "";
+        if (!token || bearer(req) !== token) return send(res, 404, { error: "not found" });
+        return send(res, 200, {
+          service: "api",
+          uptimeSec: Math.round(process.uptime()),
+          health: healthMonitor.getSnapshot(),
+        });
+      }
 
-    // --- Donations (Stripe) — raw body needed for signature verification ----
-    //
-    // ONE event matters, and it carries almost nothing we want:
-    //
-    //   checkout.session.completed   a donation went through. The only field
-    //                                read is the optional display name for the
-    //                                supporters page. Not the email, not the
-    //                                customer id, not the amount.
-    //
-    // `customer.subscription.*` is deliberately NOT handled. A recurring
-    // donation that lapses removes no access, because it granted none — there is
-    // nothing to revoke, so subscribing to those events would only invite a
-    // handler that did something.
-    if (DONATIONS_ENABLED && method === "POST" && url === "/stripe/webhook") {
-      const chunks: Buffer[] = [];
-      req.on("data", (c) => chunks.push(c as Buffer));
-      req.on("end", async () => {
-        try {
-          const event = StripeService.constructEvent(
-            Buffer.concat(chunks),
-            req.headers["stripe-signature"] as string
-          );
+      // --- Donations (Stripe) — raw body needed for signature verification ----
+      //
+      // ONE event matters, and it carries almost nothing we want:
+      //
+      //   checkout.session.completed   a donation went through. The only field
+      //                                read is the optional display name for the
+      //                                supporters page. Not the email, not the
+      //                                customer id, not the amount.
+      //
+      // `customer.subscription.*` is deliberately NOT handled. A recurring
+      // donation that lapses removes no access, because it granted none — there is
+      // nothing to revoke, so subscribing to those events would only invite a
+      // handler that did something.
+      if (DONATIONS_ENABLED && method === "POST" && url === "/stripe/webhook") {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c as Buffer));
+        req.on("end", async () => {
+          try {
+            const event = StripeService.constructEvent(
+              Buffer.concat(chunks),
+              req.headers["stripe-signature"] as string
+            );
 
-          if (event.type === "checkout.session.completed") {
-            const name = displayNameFromSession(event.data.object);
-            // Blank is the expected answer: recognition is opt-in, and a
-            // donation with no name must leave no row at all.
-            if (name) await DB.recordSupporter(name);
+            if (event.type === "checkout.session.completed") {
+              const name = displayNameFromSession(event.data.object);
+              // Blank is the expected answer: recognition is opt-in, and a
+              // donation with no name must leave no row at all.
+              if (name) await DB.recordSupporter(name);
+            }
+
+            res.writeHead(200); res.end("ok");
+          } catch (e: any) {
+            logger.error(`❌ [stripe-webhook] ${e.message}`);
+            res.writeHead(400); res.end(`Webhook Error: ${e.message}`);
           }
+        });
+        return;
+      }
+      if (DONATIONS_ENABLED && (url.startsWith("/donate") || url.startsWith("/supporters"))) {
+        handleDonate(req, res).catch((e: unknown) => {
+          logger.error("[donate] handler error", e);
+          if (!res.headersSent) { res.writeHead(500); res.end("error"); }
+        });
+        return;
+      }
 
-          res.writeHead(200); res.end("ok");
-        } catch (e: any) {
-          logger.error(`❌ [stripe-webhook] ${e.message}`);
-          res.writeHead(400); res.end(`Webhook Error: ${e.message}`);
+      // --- Directory --------------------------------------------------------
+      if (method === "GET" && url.startsWith("/users")) {
+        // Exact-username lookup only (?username=…) — no bulk enumeration (M3).
+        const q = new URL(url, "http://x").searchParams.get("username") || "";
+        const id = q ? await DB.getIdByUsername(q) : null;
+        return send(res, 200, { username: q, id });
+      }
+
+      // The public key an id names.
+      //
+      // The directory ships IDS — 64 characters per friend rather than 14474 —
+      // so a client that has just learned about someone, or that lost its local
+      // store, needs one place to fetch the key itself. This is that place.
+      //
+      // Unauthenticated, and that is deliberate: the response is a public key,
+      // the id that addresses it is derivable from that same key by anyone who
+      // holds it, and requiring a session would buy nothing an attacker does not
+      // already have. What makes it SAFE is not access control but the
+      // commitment — the caller checks `sha256(hex(key)) == id` before pinning
+      // anything, so this server cannot substitute a key even for itself.
+      //
+      // ⚠️ A client that skips that check has re-created the MITM this design
+      // exists to close. Both clients do it (lib/identity.keyMatchesId,
+      // PeerID.matches).
+      if (method === "GET" && url.startsWith("/peer/")) {
+        const m = url.match(/^\/peer\/([^/?]+)\/key$/);
+        if (!m) return send(res, 404, { error: "not found" });
+        const id = decodeURIComponent(m[1]!).toLowerCase();
+        // Shape-checked before it reaches the database: an id is a fixed-width
+        // hex string, and anything else is a caller error rather than a lookup.
+        if (!isPeerId(id)) {
+          throw new HttpError(400, "INVALID_FIELD", `id must be ${PEER_ID_LENGTH} lowercase hex characters`);
         }
-      });
-      return;
-    }
-    if (DONATIONS_ENABLED && (url.startsWith("/donate") || url.startsWith("/supporters"))) {
-      handleDonate(req, res).catch((e: unknown) => {
-        logger.error("[donate] handler error", e);
-        if (!res.headersSent) { res.writeHead(500); res.end("error"); }
-      });
-      return;
-    }
+        const identityPk = await DB.identityKey(id);
+        if (!identityPk) return send(res, 404, { error: "UNKNOWN_PEER" });
+        return send(res, 200, { id, publicKey: identityPk });
+      }
 
-    // --- Directory --------------------------------------------------------
-    if (method === "GET" && url.startsWith("/users")) {
-      // Exact-username lookup only (?username=…) — no bulk enumeration (M3).
-      const q = new URL(url, "http://x").searchParams.get("username") || "";
-      const id = q ? await DB.getIdByUsername(q) : null;
-      return send(res, 200, { username: q, id });
-    }
+      if (method === "POST" && url === "/username") {
+        const session = await authSession(req);
+        if (!session) return send(res, 401, { error: "unauthenticated" });
+        const id = session.id;
+        const body = await readJson(req);
+        const username = requireString(body, "username", { min: 3, max: 32 });
+        // The client distinguishes "someone else owns that handle" from a
+        // transient failure and shows a banner with a way out (AppState
+        // .isUsernameTaken), so this code has to survive the round trip as a code
+        // — not collapse into a generic 500 with the rest.
+        try {
+          await DB.setUsername(id, username);
+        } catch (e) {
+          const msg = (e as Error).message;
+          if (msg === "USERNAME_TAKEN") throw new HttpError(409, "USERNAME_TAKEN", "That username is taken");
+          throw new HttpError(400, "INVALID_USERNAME", msg);
+        }
+        return send(res, 200, { ok: true, username });
+      }
 
-    // The public key an id names.
-    //
-    // The directory ships IDS — 64 characters per friend rather than 14474 —
-    // so a client that has just learned about someone, or that lost its local
-    // store, needs one place to fetch the key itself. This is that place.
-    //
-    // Unauthenticated, and that is deliberate: the response is a public key,
-    // the id that addresses it is derivable from that same key by anyone who
-    // holds it, and requiring a session would buy nothing an attacker does not
-    // already have. What makes it SAFE is not access control but the
-    // commitment — the caller checks `sha256(hex(key)) == id` before pinning
-    // anything, so this server cannot substitute a key even for itself.
-    //
-    // ⚠️ A client that skips that check has re-created the MITM this design
-    // exists to close. Both clients do it (lib/identity.keyMatchesId,
-    // PeerID.matches).
-    if (method === "GET" && url.startsWith("/peer/")) {
-      const m = url.match(/^\/peer\/([^/?]+)\/key$/);
-      if (!m) return send(res, 404, { error: "not found" });
-      const id = decodeURIComponent(m[1]!).toLowerCase();
-      // Shape-checked before it reaches the database: an id is a fixed-width
-      // hex string, and anything else is a caller error rather than a lookup.
-      if (!isPeerId(id)) {
-        throw new HttpError(400, "INVALID_FIELD", `id must be ${PEER_ID_LENGTH} lowercase hex characters`);
+      // --- Friend graph (also hands out the MQTT topic ids) ------------------
+      if (method === "GET" && url === "/friends") {
+        const session = await authSession(req);
+        if (!session) return send(res, 401, { error: "unauthenticated" });
+        const id = session.id;
+        return send(res, 200, { friends: await DB.getFriendsList(id) });
       }
-      const identityPk = await DB.identityKey(id);
-      if (!identityPk) return send(res, 404, { error: "UNKNOWN_PEER" });
-      return send(res, 200, { id, publicKey: identityPk });
-    }
-
-    if (method === "POST" && url === "/username") {
-      const session = await authSession(req);
-      if (!session) return send(res, 401, { error: "unauthenticated" });
-      const id = session.id;
-      const body = await readJson(req);
-      const username = requireString(body, "username", { min: 3, max: 32 });
-      // The client distinguishes "someone else owns that handle" from a
-      // transient failure and shows a banner with a way out (AppState
-      // .isUsernameTaken), so this code has to survive the round trip as a code
-      // — not collapse into a generic 500 with the rest.
-      try {
-        await DB.setUsername(id, username);
-      } catch (e) {
-        const msg = (e as Error).message;
-        if (msg === "USERNAME_TAKEN") throw new HttpError(409, "USERNAME_TAKEN", "That username is taken");
-        throw new HttpError(400, "INVALID_USERNAME", msg);
+      if (method === "GET" && url === "/friends/invites") {
+        const session = await authSession(req);
+        if (!session) return send(res, 401, { error: "unauthenticated" });
+        const id = session.id;
+        return send(res, 200, { invites: await DB.getMyInvites(id) });
       }
-      return send(res, 200, { ok: true, username });
-    }
-
-    // --- Friend graph (also maintains the MQTT ACL) -----------------------
-    if (method === "GET" && url === "/friends") {
-      const session = await authSession(req);
-      if (!session) return send(res, 401, { error: "unauthenticated" });
-      const id = session.id;
-      return send(res, 200, { friends: await DB.getFriendsList(id) });
-    }
-    if (method === "GET" && url === "/friends/invites") {
-      const session = await authSession(req);
-      if (!session) return send(res, 401, { error: "unauthenticated" });
-      const id = session.id;
-      return send(res, 200, { invites: await DB.getMyInvites(id) });
-    }
-    if (method === "POST" && url === "/friends/invite") {
-      const session = await authSession(req);
-      if (!session) return send(res, 401, { error: "unauthenticated" });
-      const id = session.id;
-      // What used to be the paywall. A subscription bought the right to grow
-      // the friend graph at all; now everyone has it, and what stands here
-      // instead are ceilings — high enough that no real account meets them,
-      // low enough that a script cannot turn one signup into unbounded work.
-      //
-      // Deliberately NOT 402. The app reads 402 as "fall back to the free
-      // door" and re-authenticates; a user who hit a daily invite limit would
-      // silently lose their friend topics for the trouble.
-      if (await DB.countFriends(id) >= FRIEND_CAP) {
-        return send(res, 409, { error: "FRIEND_LIMIT", limit: FRIEND_CAP });
-      }
-      const sent = await DB.bumpCounter(`invite:day:${id}`, 24 * 60 * 60);
-      if (sent > INVITES_PER_DAY) {
-        logger.warn(`[friends] invite rate-limited for ${id.slice(0, 12)}… (${sent}/${INVITES_PER_DAY} today)`);
-        return send(res, 429, { error: "RATE_LIMITED", limit: INVITES_PER_DAY });
-      }
-      const to = requireString(await readJson(req), "to", { max: MAX_PEER_IDENTIFIER });
-      // A block that a re-invite can walk through is not a block. Checked in
-      // EITHER direction: the blocked party must not be able to re-open the
-      // conversation, and the blocker must not be able to do it by accident
-      // either — their client should be hiding this person, and if it is asking,
-      // it is out of date rather than right.
-      //
-      // 404, deliberately, and the same 404 an unknown handle gets. Telling an
-      // invite apart from a block tells the blocked party they were blocked,
-      // which is the one thing a block should not announce.
-      const blockTarget = await DB.resolveToId(to);
-      if (blockTarget && (await DB.isBlocked(id, blockTarget))) {
-        logger.debug(`[friends] invite refused: ${id.slice(0, 12)}… and ${blockTarget.slice(0, 12)}… are blocked`);
-        return send(res, 404, { error: "NOT_FOUND" });
-      }
-      try {
-        await DB.invite(id, to);
-      } catch (e) {
-        // `DB.invite` refuses three ordinary things by throwing a plain Error,
-        // and until the block landed every one of them came back as a 500: a
-        // user typing a handle that does not exist produced a Sentry event and
-        // an "internal error" in the app. That was invisible because the two
-        // tests covering it sent the field name `peer`, which this route does
-        // not read, so both were refused at validation and never reached here
-        // (test/api-routes.test.ts — fixed alongside this).
+      if (method === "POST" && url === "/friends/invite") {
+        const session = await authSession(req);
+        if (!session) return send(res, 401, { error: "unauthenticated" });
+        const id = session.id;
+        // What used to be the paywall. A subscription bought the right to grow
+        // the friend graph at all; now everyone has it, and what stands here
+        // instead are ceilings — high enough that no real account meets them,
+        // low enough that a script cannot turn one signup into unbounded work.
         //
-        // It stopped being only a quality problem when blocking arrived: a block
-        // answers 404, so a 500 for a stranger is the difference that tells the
-        // blocked party which of the two they are. The statuses have to agree.
-        const msg = (e as Error).message;
-        if (msg === "User not found") return send(res, 404, { error: "NOT_FOUND" });
-        if (msg === "Self-invite not allowed") {
-          throw new HttpError(400, "SELF_INVITE", "You cannot invite yourself");
+        // Deliberately NOT 402. The app reads 402 as "fall back to the free
+        // door" and re-authenticates; a user who hit a daily invite limit would
+        // silently lose their friend topics for the trouble.
+        if (await DB.countFriends(id) >= FRIEND_CAP) {
+          return send(res, 409, { error: "FRIEND_LIMIT", limit: FRIEND_CAP });
         }
-        if (msg === "Already friends") {
-          throw new HttpError(409, "ALREADY_FRIENDS", "You are already friends");
+        const sent = await DB.bumpCounter(`invite:day:${id}`, 24 * 60 * 60);
+        if (sent > INVITES_PER_DAY) {
+          logger.warn(`[friends] invite rate-limited for ${id.slice(0, 12)}… (${sent}/${INVITES_PER_DAY} today)`);
+          return send(res, 429, { error: "RATE_LIMITED", limit: INVITES_PER_DAY });
         }
-        throw e;
+        const to = requireString(await readJson(req), "to", { max: MAX_PEER_IDENTIFIER });
+        // A block that a re-invite can walk through is not a block. Checked in
+        // EITHER direction: the blocked party must not be able to re-open the
+        // conversation, and the blocker must not be able to do it by accident
+        // either — their client should be hiding this person, and if it is asking,
+        // it is out of date rather than right.
+        //
+        // 404, deliberately, and the same 404 an unknown handle gets. Telling an
+        // invite apart from a block tells the blocked party they were blocked,
+        // which is the one thing a block should not announce.
+        const blockTarget = await DB.resolveToId(to);
+        if (blockTarget && (await DB.isBlocked(id, blockTarget))) {
+          logger.debug(`[friends] invite refused: ${id.slice(0, 12)}… and ${blockTarget.slice(0, 12)}… are blocked`);
+          return send(res, 404, { error: "NOT_FOUND" });
+        }
+        try {
+          await DB.invite(id, to);
+        } catch (e) {
+          // `DB.invite` refuses three ordinary things by throwing a plain Error,
+          // and until the block landed every one of them came back as a 500: a
+          // user typing a handle that does not exist produced a Sentry event and
+          // an "internal error" in the app. That was invisible because the two
+          // tests covering it sent the field name `peer`, which this route does
+          // not read, so both were refused at validation and never reached here
+          // (test/api-routes.test.ts — fixed alongside this).
+          //
+          // It stopped being only a quality problem when blocking arrived: a block
+          // answers 404, so a 500 for a stranger is the difference that tells the
+          // blocked party which of the two they are. The statuses have to agree.
+          const msg = (e as Error).message;
+          if (msg === "User not found") return send(res, 404, { error: "NOT_FOUND" });
+          if (msg === "Self-invite not allowed") {
+            throw new HttpError(400, "SELF_INVITE", "You cannot invite yourself");
+          }
+          if (msg === "Already friends") {
+            throw new HttpError(409, "ALREADY_FRIENDS", "You are already friends");
+          }
+          throw e;
+        }
+        // The recipient has no other way to learn an invite exists: nothing pushed
+        // graph changes, so an invite sat unseen until their next poll — which is
+        // why one needed a manual refresh to appear at all.
+        const toId = await DB.resolveToId(to);
+        if (toId) await EMQX.notifyGraphChanged([toId]);
+        return send(res, 200, { ok: true });
       }
-      // The recipient has no other way to learn an invite exists: nothing pushed
-      // graph changes, so an invite sat unseen until their next poll — which is
-      // why one needed a manual refresh to appear at all.
-      const toId = await DB.resolveToId(to);
-      if (toId) await EMQX.notifyGraphChanged([toId]);
-      return send(res, 200, { ok: true });
-    }
-    if (method === "POST" && url === "/friends/accept") {
-      const session = await authSession(req);
-      if (!session) return send(res, 401, { error: "unauthenticated" });
-      const id = session.id;
-      if (await DB.countFriends(id) >= FRIEND_CAP) {
-        return send(res, 409, { error: "FRIEND_LIMIT", limit: FRIEND_CAP });
+      if (method === "POST" && url === "/friends/accept") {
+        const session = await authSession(req);
+        if (!session) return send(res, 401, { error: "unauthenticated" });
+        const id = session.id;
+        if (await DB.countFriends(id) >= FRIEND_CAP) {
+          return send(res, 409, { error: "FRIEND_LIMIT", limit: FRIEND_CAP });
+        }
+        const from = requireString(await readJson(req), "from", { max: MAX_PEER_IDENTIFIER });
+        const fromId = await DB.resolveToId(from);
+        // BOTH sides, because a friendship adds a contact to each. The inviter
+        // was under the cap when they sent it; accepting is what would push them
+        // over, and only this side can see that.
+        if (fromId && (await DB.countFriends(fromId)) >= FRIEND_CAP) {
+          return send(res, 409, { error: "FRIEND_LIMIT", limit: FRIEND_CAP, peer: true });
+        }
+        // The invite may predate the block — blocking cancels pending invites in
+        // both directions, but an invite can also arrive at a device that is
+        // offline, and the accept is what would rebuild the friendship.
+        if (fromId && (await DB.isBlocked(id, fromId))) {
+          return send(res, 404, { error: "NOT_FOUND" });
+        }
+        const ok = fromId ? await DB.acceptInvite(fromId, id) : false;
+        // Both sides.
+        //
+        //
+        // The inviter is the one that matters. They invited a HANDLE, so their
+        // contact row holds no client id until a directory sync fills it in — and
+        // the accepter now greets immediately, so that greeting reached the
+        // inviter BEFORE they knew who the sender was. The frame named an id their
+        // directory did not contain, and it was dropped. Nudging here closes the
+        // window instead of leaving it to a 60-second timer.
+        if (ok && fromId) await EMQX.notifyGraphChanged([fromId, id]);
+        // The accepter greets immediately, so it gets the new friendship's topic
+        // ids here rather than after a /friends round trip.
+        const topics = ok && fromId ? await DB.getFriendshipTopics(id, fromId) : null;
+        return send(res, ok ? 200 : 400, {
+          ok,
+          ...(topics && fromId
+            ? { friend: { id: fromId, convo_id: topics.convoId, handshake_id: topics.handshakeId } }
+            : {}),
+        });
       }
-      const from = requireString(await readJson(req), "from", { max: MAX_PEER_IDENTIFIER });
-      const fromId = await DB.resolveToId(from);
-      // BOTH sides, because a friendship adds a contact to each. The inviter
-      // was under the cap when they sent it; accepting is what would push them
-      // over, and only this side can see that.
-      if (fromId && (await DB.countFriends(fromId)) >= FRIEND_CAP) {
-        return send(res, 409, { error: "FRIEND_LIMIT", limit: FRIEND_CAP, peer: true });
+      if (method === "POST" && url === "/friends/cancel") {
+        const session = await authSession(req);
+        if (!session) return send(res, 401, { error: "unauthenticated" });
+        const id = session.id;
+        const peer = requireString(await readJson(req), "peer", { max: MAX_PEER_IDENTIFIER });
+        // Withdraw an invite we sent, or decline one addressed to us. Only one of
+        // the two can match a real pending invite.
+        const withdrew = await DB.cancelInvite(id, peer);
+        const declined = withdrew ? false : await DB.declineInvite(id, peer);
+        const ok = withdrew || declined;
+        if (ok) {
+          const peerId = await DB.resolveToId(peer);
+          if (peerId) await EMQX.notifyGraphChanged([peerId, id]);
+        }
+        return send(res, ok ? 200 : 400, { ok });
       }
-      // The invite may predate the block — blocking cancels pending invites in
-      // both directions, but an invite can also arrive at a device that is
-      // offline, and the accept is what would rebuild the friendship.
-      if (fromId && (await DB.isBlocked(id, fromId))) {
-        return send(res, 404, { error: "NOT_FOUND" });
-      }
-      const ok = fromId ? await DB.acceptInvite(fromId, id) : false;
-      // Grant the conversation + presence topics to BOTH members.
-      if (ok && fromId) await DB.grantFriendTopic(id, fromId);
-      // AFTER the grant, and both sides.
-      //
-      // The inviter is the one that matters. They invited a HANDLE, so their
-      // contact row holds no client id until a directory sync fills it in — and
-      // the accepter now greets immediately, so that greeting reached the
-      // inviter BEFORE they knew who the sender was. The frame named an id their
-      // directory did not contain, and it was dropped. Nudging here closes the
-      // window instead of leaving it to a 60-second timer.
-      if (ok && fromId) await EMQX.notifyGraphChanged([fromId, id]);
-      return send(res, ok ? 200 : 400, { ok });
-    }
-    if (method === "POST" && url === "/friends/cancel") {
-      const session = await authSession(req);
-      if (!session) return send(res, 401, { error: "unauthenticated" });
-      const id = session.id;
-      const peer = requireString(await readJson(req), "peer", { max: MAX_PEER_IDENTIFIER });
-      // Withdraw an invite we sent, or decline one addressed to us. Only one of
-      // the two can match a real pending invite.
-      const withdrew = await DB.cancelInvite(id, peer);
-      const declined = withdrew ? false : await DB.declineInvite(id, peer);
-      const ok = withdrew || declined;
-      if (ok) {
+      if (method === "POST" && url === "/friends/remove") {
+        const session = await authSession(req);
+        if (!session) return send(res, 401, { error: "unauthenticated" });
+        const id = session.id;
+        const peer = requireString(await readJson(req), "peer", { max: MAX_PEER_IDENTIFIER });
         const peerId = await DB.resolveToId(peer);
-        if (peerId) await EMQX.notifyGraphChanged([peerId, id]);
-      }
-      return send(res, ok ? 200 : 400, { ok });
-    }
-    if (method === "POST" && url === "/friends/remove") {
-      const session = await authSession(req);
-      if (!session) return send(res, 401, { error: "unauthenticated" });
-      const id = session.id;
-      const peer = requireString(await readJson(req), "peer", { max: MAX_PEER_IDENTIFIER });
-      const peerId = await DB.resolveToId(peer);
-      const ok = await DB.removeFriend(id, peer);
-      if (ok && peerId) {
-        await DB.revokeFriendTopic(id, peerId);
-        // The ACL edit blocks the NEXT authorization check; a subscription that
-        // is already open keeps delivering until the client disconnects for its
-        // own reasons (ASVS-1). Drop it now. Best effort by design — the
-        // unfriend has already succeeded and must not fail on the broker.
-        //
-        // This is the line that has never once worked on this deployment. Both
-        // arguments used to be 14474-character public keys, so the admin URL it
-        // built was ~29 kB and EMQX answered 414 every single time — and because
-        // authorization is checked at SUBSCRIBE, the unfriended peer's open
-        // subscription kept delivering. At 64 characters the request fits.
-        await EMQX.revokeTopic(id, peerId, `c/${friendshipHash(id, peerId)}`);
-        // Both sides: the removed peer should stop showing a contact they can no
-        // longer reach, and the remover's other devices need the same news.
-        await EMQX.notifyGraphChanged([peerId, id]);
-      }
-      return send(res, ok ? 200 : 400, { ok });
-    }
-
-    // --- Moderation: report + block ---------------------------------------
-    //
-    // App Store Guideline 1.2 asks a UGC app for a way to report content AND a
-    // way to block a person. Shipping one without the other is a routine
-    // rejection, and they are here together for that reason as much as any
-    // other: a report is a request to someone else, and a block is the thing
-    // the user can do about it themselves, immediately, without waiting for us.
-    //
-    // ORDER MATTERS AND THE CLIENT MUST GET IT RIGHT. /report requires the
-    // reporter to be a member of the conversation it names, and /friends/block
-    // tears the friendship down — so a client that blocks first can no longer
-    // report. Report, then block. The UI does both from one gesture and in that
-    // order; this comment is here because the two routes cannot enforce it
-    // between themselves.
-    if (method === "POST" && url === "/report") {
-      const session = await authSession(req);
-      if (!session) return send(res, 401, { error: "unauthenticated" });
-      const id = session.id;
-
-      // Before anything else is read. A report costs a row holding message
-      // content, so the cap is what stops one account turning the moderation
-      // queue into a place to publish — and it is counted on the existing
-      // rate_counters table, like invites, rather than on new storage.
-      const filed = await DB.bumpCounter(`report:day:${id}`, 24 * 60 * 60);
-      if (filed > REPORTS_PER_DAY) {
-        logger.warn(`[report] rate-limited for ${id.slice(0, 12)}… (${filed}/${REPORTS_PER_DAY} today)`);
-        return send(res, 429, { error: "RATE_LIMITED", limit: REPORTS_PER_DAY });
-      }
-
-      const body = await readJson(req);
-      const conversation = requireHex(body, "conversation", 32).toLowerCase();
-
-      // Membership decides who may be reported, and it decides it from the
-      // SERVER'S copy of the friend graph rather than from anything the client
-      // sent. That is what makes "report a stranger" unrepresentable instead of
-      // merely refused: there is no field to put a stranger's id in.
-      const members = await DB.getHashMembers(conversation);
-      if (members.length !== 2) {
-        return send(res, 404, { error: "NO_CONVERSATION" });
-      }
-      if (!members.includes(id)) {
-        logger.warn(`[report] ${id.slice(0, 12)}… named a conversation it is not a member of`);
-        return send(res, 403, { error: "NOT_A_MEMBER" });
-      }
-      const reportedId = members[0] === id ? members[1]! : members[0]!;
-
-      // `peer` is redundant — the line above already derived it — and that is
-      // exactly why it is required. A client that disagrees with the server
-      // about whose conversation this is has a bug, and filing a report against
-      // the wrong person is the worst possible moment to discover it.
-      const peer = requireString(body, "peer", { max: MAX_PEER_IDENTIFIER });
-      if (peer.toLowerCase() !== reportedId) {
-        return send(res, 400, { error: "PEER_MISMATCH",
-          message: "peer is not the other member of that conversation" });
-      }
-
-      const category = requireString(body, "category", { max: 32 }).toLowerCase();
-      if (!(DB.reportCategories as readonly string[]).includes(category)) {
-        throw new HttpError(400, "INVALID_FIELD",
-          `category must be one of: ${DB.reportCategories.join(", ")}`);
-      }
-
-      const reportId = await DB.createReport({
-        reporterId: id,
-        reportedId,
-        conversationHash: conversation,
-        category,
-        note: optionalString(body, "note", { max: MAX_REPORT_NOTE }),
-        // The reporter's own plaintext copy, by consent, and NOT verifiable —
-        // see migrations/006_reports.sql §0. Nothing downstream may present it
-        // as evidence of what was said, only as what was handed in.
-        excerpt: optionalString(body, "excerpt", { max: MAX_REPORT_EXCERPT }),
-        frame: optionalBase64(body, "frame", MAX_REPORT_FRAME_BYTES),
-        messageId: reportMessageId(body),
-      });
-
-      // The operator signal, and the reason `logger.event` exists at all.
-      //
-      // There is no mail path in this stack — docs/product/publishing.md records
-      // resend_api_key as no longer used — so the 24-hour commitment on /eula
-      // rests on this line and on `npm run reports`, both of which are in
-      // docs/runbooks/moderation.md.
-      //
-      // NOT `warn`: warn only drops a Sentry breadcrumb, so the line would be
-      // invisible until something else crashed and carried it along. NOT
-      // `error` either: a report is not a failure, and error is throttled per
-      // fingerprint — a mechanism for suppressing repetition, which is the
-      // opposite of what a second report in an hour deserves.
-      //
-      // No message content in it. The excerpt is in the row for an operator who
-      // opens it, not in a log line that fans out to Sentry, Docker and whatever
-      // reads either.
-      logger.event(
-        `[report] filed ${reportId} — ${category} against ${reportedId.slice(0, 12)}… ` +
-        `by ${id.slice(0, 12)}… (see docs/runbooks/moderation.md)`
-      );
-      return send(res, 200, { ok: true, id: reportId });
-    }
-
-    // A block is an unfriend PLUS a row that outlives it. Without the row the
-    // blocked party re-invites and the block has evaporated — which is the
-    // ordinary way this feature is got wrong, and why `blocks` is its own table
-    // rather than a column on the friendship the block itself deletes.
-    if (method === "POST" && url === "/friends/block") {
-      const session = await authSession(req);
-      if (!session) return send(res, 401, { error: "unauthenticated" });
-      const id = session.id;
-      const peer = requireString(await readJson(req), "peer", { max: MAX_PEER_IDENTIFIER });
-      const peerId = await DB.resolveToId(peer);
-      if (!peerId) return send(res, 404, { error: "NOT_FOUND" });
-      if (peerId === id) return send(res, 400, { error: "SELF_BLOCK" });
-
-      // The row FIRST. Every line below it is best-effort teardown, and a block
-      // that recorded nothing because the broker was unreachable would be a
-      // block the user was told they had.
-      await DB.block(id, peerId);
-
-      // A pending invite in either direction is a live route back in, so it
-      // goes with the friendship. Both calls are no-ops when there is nothing
-      // pending, which is the common case.
-      await DB.cancelInvite(id, peerId);
-      await DB.declineInvite(id, peerId);
-
-      const wasFriend = await DB.removeFriend(id, peerId);
-      if (wasFriend) {
-        await DB.revokeFriendTopic(id, peerId);
-        // As in /friends/remove: the ACL edit stops the NEXT authorization
-        // check, and a subscription that is already open keeps delivering until
-        // the client disconnects for its own reasons (ASVS-1). Drop it now.
-        await EMQX.revokeTopic(id, peerId, `c/${friendshipHash(id, peerId)}`);
-      }
-      // Both sides either way — the blocked peer should stop showing a contact
-      // they can no longer reach even if the friendship row was already gone,
-      // and the blocker's other devices need the same news.
-      await EMQX.notifyGraphChanged([peerId, id]);
-      return send(res, 200, { ok: true });
-    }
-
-    if (method === "POST" && url === "/friends/unblock") {
-      const session = await authSession(req);
-      if (!session) return send(res, 401, { error: "unauthenticated" });
-      const id = session.id;
-      const peer = requireString(await readJson(req), "peer", { max: MAX_PEER_IDENTIFIER });
-      const peerId = await DB.resolveToId(peer);
-      if (!peerId) return send(res, 404, { error: "NOT_FOUND" });
-      // Lifting a block does NOT restore the friendship. The pair re-invite like
-      // strangers, which is exactly what an ordinary unfriend leaves behind —
-      // restoring it silently would hand back a conversation topic the user
-      // deliberately tore down.
-      const ok = await DB.unblock(id, peerId);
-      if (ok) await EMQX.notifyGraphChanged([peerId, id]);
-      return send(res, ok ? 200 : 400, { ok });
-    }
-
-    // The client needs this to keep a blocked contact visible-but-inert. Absence
-    // from /friends otherwise means "delete this row and its history" to
-    // DirectorySync, so without this list a block silently destroys the very
-    // conversation the user blocked someone over.
-    if (method === "GET" && url === "/friends/blocked") {
-      const session = await authSession(req);
-      if (!session) return send(res, 401, { error: "unauthenticated" });
-      return send(res, 200, { blocked: await DB.blockedIds(session.id) });
-    }
-
-    // --- Prekeys ----------------------------------------------------------
-    // The ephemeral half of the initial key agreement (003_prekeys.sql). The
-    // server is untrusted here by design: it can withhold one-time keys to force
-    // the weaker medium-term fallback, but it cannot read anything, because the
-    // initiator also encapsulates to the peer's PINNED identity key and mixes
-    // both secrets into the root.
-    if (method === "POST" && url === "/prekeys") {
-      const session = await authSession(req);
-      if (!session) return send(res, 401, { error: "unauthenticated" });
-      const id = session.id;
-      const body = await readJson(req);
-      const medium = requireHex(body, "medium", HQC_PUBLIC_KEY_BYTES);
-
-      const raw = Array.isArray(body?.oneTime) ? body.oneTime : [];
-      if (raw.length > MAX_ONETIME_PER_UPLOAD) {
-        throw new HttpError(400, "TOO_MANY_PREKEYS",
-          `at most ${MAX_ONETIME_PER_UPLOAD} one-time prekeys per upload`);
-      }
-      const oneTime = raw.map((entry: unknown, i: number) => {
-        const item = entry as Record<string, unknown>;
-        const id = item?.id;
-        if (!Number.isInteger(id) || (id as number) < 0) {
-          throw new HttpError(400, "INVALID_FIELD", `oneTime[${i}].id must be a non-negative integer`);
+        const topics = peerId ? await DB.removeFriendTopics(id, peerId) : null;
+        const ok = topics !== null;
+        if (topics && peerId) {
+          // Deleting the row retires the topic ids: a re-friend mints new ones,
+          // so nobody publishes to these again. What the delete cannot reach is
+          // a subscription that is already open, and the ex-friend holds the ids
+          // — drop both members off both topics now. Best effort by design: the
+          // unfriend has already succeeded and must not fail on the broker.
+          await EMQX.revokeFriendshipTopics(id, peerId, topics);
+          // Both sides: the removed peer should stop showing a contact they can no
+          // longer reach, and the remover's other devices need the same news.
+          await EMQX.notifyGraphChanged([peerId, id]);
         }
-        return { id: id as number, prekey: requireHex(item, "prekey", HQC_PUBLIC_KEY_BYTES) };
-      });
-
-      await DB.putPrekeyBundle(id, medium, oneTime);
-      return send(res, 200, { ok: true, accepted: oneTime.length });
-    }
-
-    // Claim one prekey for a peer. POST rather than GET with the peer in the
-    // path — kept that way now that an id would fit in a URL, because the
-    // RESPONSE is key material and has no business in an access log or a proxy
-    // cache, and because a claim mutates (it consumes a one-time key).
-    if (method === "POST" && url === "/prekeys/claim") {
-      const session = await authSession(req);
-      if (!session) return send(res, 401, { error: "unauthenticated" });
-      const id = session.id;
-      const peer = requireString(await readJson(req), "peer", { max: MAX_PEER_IDENTIFIER });
-      const peerId = await DB.resolveToId(peer);
-      // Friendship is the authorization. Without it, anyone with a session could
-      // drain a stranger's one-time pool — a cheap way to force every one of
-      // their future conversations onto the reusable medium-term key.
-      if (!peerId || !(await DB.areFriends(id, peerId))) {
-        return send(res, 403, { error: "NOT_FRIENDS" });
+        return send(res, ok ? 200 : 400, { ok });
       }
-      const claimed = await DB.claimPrekey(peerId);
-      if (!claimed) return send(res, 404, { error: "NO_PREKEYS" });
-      return send(res, 200, claimed);
-    }
 
-    // How many one-time keys this account has left, so the client knows when to
-    // replenish. Only ever about the caller's own pool.
-    if (method === "GET" && url === "/prekeys/count") {
-      const session = await authSession(req);
-      if (!session) return send(res, 401, { error: "unauthenticated" });
-      const id = session.id;
-      return send(res, 200, {
-        remaining: await DB.countOneTimePrekeys(id),
-        maxId: await DB.maxOneTimePrekeyId(id),
-        target: MAX_ONETIME_PER_UPLOAD,
-      });
-    }
+      // --- Moderation: report + block ---------------------------------------
+      //
+      // App Store Guideline 1.2 asks a UGC app for a way to report content AND a
+      // way to block a person. Shipping one without the other is a routine
+      // rejection, and they are here together for that reason as much as any
+      // other: a report is a request to someone else, and a block is the thing
+      // the user can do about it themselves, immediately, without waiting for us.
+      //
+      // ORDER MATTERS AND THE CLIENT MUST GET IT RIGHT. /report requires the
+      // reporter to be a member of the conversation it names, and /friends/block
+      // tears the friendship down — so a client that blocks first can no longer
+      // report. Report, then block. The UI does both from one gesture and in that
+      // order; this comment is here because the two routes cannot enforce it
+      // between themselves.
+      if (method === "POST" && url === "/report") {
+        const session = await authSession(req);
+        if (!session) return send(res, 401, { error: "unauthenticated" });
+        const id = session.id;
 
-    // --- Push token -------------------------------------------------------
-    if (method === "POST" && url === "/push/token") {
-      const session = await authSession(req);
-      if (!session) return send(res, 401, { error: "unauthenticated" });
-      const id = session.id;
-      const pushBody = await readJson(req);
-      const platform = requireString({ platform: pushBody.platform ?? "ios" }, "platform", { max: 16 });
-      const token = requireString(pushBody, "token", { min: 8, max: 512 });
-      await DB.setPushToken(id, platform, token);
-      return send(res, 200, { ok: true });
-    }
+        // Before anything else is read. A report costs a row holding message
+        // content, so the cap is what stops one account turning the moderation
+        // queue into a place to publish — and it is counted on the existing
+        // rate_counters table, like invites, rather than on new storage.
+        const filed = await DB.bumpCounter(`report:day:${id}`, 24 * 60 * 60);
+        if (filed > REPORTS_PER_DAY) {
+          logger.warn(`[report] rate-limited for ${id.slice(0, 12)}… (${filed}/${REPORTS_PER_DAY} today)`);
+          return send(res, 429, { error: "RATE_LIMITED", limit: REPORTS_PER_DAY });
+        }
 
-    // --- Account deletion (purge + revoke MQTT + session tokens) ----------
-    if (method === "POST" && url === "/account/delete") {
-      const session = await authSession(req);
-      if (!session) return send(res, 401, { error: "unauthenticated" });
-      const id = session.id;
-      await DB.deleteUser(id);
-      await DB.revokeMqttAuth(id);
-      await DB.revokeSessionToken(bearer(req));
-      // Everything above stops the NEXT connect. This ends the current one —
-      // otherwise a deleted account keeps a live session, and its queued backlog,
-      // for as long as the connection happens to last. It also only started
-      // working when the client id stopped being a 14 kB URL path segment.
-      await EMQX.kick(id);
-      return send(res, 200, { ok: true });
-    }
+        const body = await readJson(req);
+        const conversation = requireHex(body, "conversation", 32).toLowerCase();
 
-    return send(res, 404, { error: "not found" });
-  } catch (e) {
-    // A validation failure is the caller's problem and says which field; anything
-    // else is ours, and its detail goes to the log and Sentry rather than to the
-    // client. Previously every error came back as a 400 carrying its raw message,
-    // which leaked internals (database errors included) to whoever asked.
-    if (e instanceof HttpError) {
-      return send(res, e.status, { error: e.code, message: e.message });
+        // Membership decides who may be reported, and it decides it from the
+        // SERVER'S copy of the friend graph rather than from anything the client
+        // sent. That is what makes "report a stranger" unrepresentable instead of
+        // merely refused: there is no field to put a stranger's id in.
+        const members = await DB.getHashMembers(conversation);
+        if (members.length !== 2) {
+          return send(res, 404, { error: "NO_CONVERSATION" });
+        }
+        if (!members.includes(id)) {
+          logger.warn(`[report] ${id.slice(0, 12)}… named a conversation it is not a member of`);
+          return send(res, 403, { error: "NOT_A_MEMBER" });
+        }
+        const reportedId = members[0] === id ? members[1]! : members[0]!;
+
+        // `peer` is redundant — the line above already derived it — and that is
+        // exactly why it is required. A client that disagrees with the server
+        // about whose conversation this is has a bug, and filing a report against
+        // the wrong person is the worst possible moment to discover it.
+        const peer = requireString(body, "peer", { max: MAX_PEER_IDENTIFIER });
+        if (peer.toLowerCase() !== reportedId) {
+          return send(res, 400, {
+            error: "PEER_MISMATCH",
+            message: "peer is not the other member of that conversation"
+          });
+        }
+
+        const category = requireString(body, "category", { max: 32 }).toLowerCase();
+        if (!(DB.reportCategories as readonly string[]).includes(category)) {
+          throw new HttpError(400, "INVALID_FIELD",
+            `category must be one of: ${DB.reportCategories.join(", ")}`);
+        }
+
+        const reportId = await DB.createReport({
+          reporterId: id,
+          reportedId,
+          conversationHash: conversation,
+          category,
+          note: optionalString(body, "note", { max: MAX_REPORT_NOTE }),
+          // The reporter's own plaintext copy, by consent, and NOT verifiable —
+          // see migrations/006_reports.sql §0. Nothing downstream may present it
+          // as evidence of what was said, only as what was handed in.
+          excerpt: optionalString(body, "excerpt", { max: MAX_REPORT_EXCERPT }),
+          frame: optionalBase64(body, "frame", MAX_REPORT_FRAME_BYTES),
+          messageId: reportMessageId(body),
+        });
+
+        // The operator signal, and the reason `logger.event` exists at all.
+        //
+        // There is no mail path in this stack — docs/product/publishing.md records
+        // resend_api_key as no longer used — so the 24-hour commitment on /eula
+        // rests on this line and on `npm run reports`, both of which are in
+        // docs/runbooks/moderation.md.
+        //
+        // NOT `warn`: warn only drops a Sentry breadcrumb, so the line would be
+        // invisible until something else crashed and carried it along. NOT
+        // `error` either: a report is not a failure, and error is throttled per
+        // fingerprint — a mechanism for suppressing repetition, which is the
+        // opposite of what a second report in an hour deserves.
+        //
+        // No message content in it. The excerpt is in the row for an operator who
+        // opens it, not in a log line that fans out to Sentry, Docker and whatever
+        // reads either.
+        logger.event(
+          `[report] filed ${reportId} — ${category} against ${reportedId.slice(0, 12)}… ` +
+          `by ${id.slice(0, 12)}… (see docs/runbooks/moderation.md)`
+        );
+        return send(res, 200, { ok: true, id: reportId });
+      }
+
+      // A block is an unfriend PLUS a row that outlives it. Without the row the
+      // blocked party re-invites and the block has evaporated — which is the
+      // ordinary way this feature is got wrong, and why `blocks` is its own table
+      // rather than a column on the friendship the block itself deletes.
+      if (method === "POST" && url === "/friends/block") {
+        const session = await authSession(req);
+        if (!session) return send(res, 401, { error: "unauthenticated" });
+        const id = session.id;
+        const peer = requireString(await readJson(req), "peer", { max: MAX_PEER_IDENTIFIER });
+        const peerId = await DB.resolveToId(peer);
+        if (!peerId) return send(res, 404, { error: "NOT_FOUND" });
+        if (peerId === id) return send(res, 400, { error: "SELF_BLOCK" });
+
+        // The row FIRST. Every line below it is best-effort teardown, and a block
+        // that recorded nothing because the broker was unreachable would be a
+        // block the user was told they had.
+        await DB.block(id, peerId);
+
+        // A pending invite in either direction is a live route back in, so it
+        // goes with the friendship. Both calls are no-ops when there is nothing
+        // pending, which is the common case.
+        await DB.cancelInvite(id, peerId);
+        await DB.declineInvite(id, peerId);
+
+        const topics = await DB.removeFriendTopics(id, peerId);
+        // As in /friends/remove: the delete retires the ids, and this drops the
+        // subscriptions already open on them.
+        if (topics) await EMQX.revokeFriendshipTopics(id, peerId, topics);
+        // Both sides either way — the blocked peer should stop showing a contact
+        // they can no longer reach even if the friendship row was already gone,
+        // and the blocker's other devices need the same news.
+        await EMQX.notifyGraphChanged([peerId, id]);
+        return send(res, 200, { ok: true });
+      }
+
+      if (method === "POST" && url === "/friends/unblock") {
+        const session = await authSession(req);
+        if (!session) return send(res, 401, { error: "unauthenticated" });
+        const id = session.id;
+        const peer = requireString(await readJson(req), "peer", { max: MAX_PEER_IDENTIFIER });
+        const peerId = await DB.resolveToId(peer);
+        if (!peerId) return send(res, 404, { error: "NOT_FOUND" });
+        // Lifting a block does NOT restore the friendship. The pair re-invite like
+        // strangers, which is exactly what an ordinary unfriend leaves behind —
+        // restoring it silently would hand back a conversation topic the user
+        // deliberately tore down.
+        const ok = await DB.unblock(id, peerId);
+        if (ok) await EMQX.notifyGraphChanged([peerId, id]);
+        return send(res, ok ? 200 : 400, { ok });
+      }
+
+      // The client needs this to keep a blocked contact visible-but-inert. Absence
+      // from /friends otherwise means "delete this row and its history" to
+      // DirectorySync, so without this list a block silently destroys the very
+      // conversation the user blocked someone over.
+      if (method === "GET" && url === "/friends/blocked") {
+        const session = await authSession(req);
+        if (!session) return send(res, 401, { error: "unauthenticated" });
+        return send(res, 200, { blocked: await DB.blockedIds(session.id) });
+      }
+
+      // --- Prekeys ----------------------------------------------------------
+      // The ephemeral half of the initial key agreement (003_prekeys.sql). The
+      // server is untrusted here by design: it can withhold one-time keys to force
+      // the weaker medium-term fallback, but it cannot read anything, because the
+      // initiator also encapsulates to the peer's PINNED identity key and mixes
+      // both secrets into the root.
+      if (method === "POST" && url === "/prekeys") {
+        const session = await authSession(req);
+        if (!session) return send(res, 401, { error: "unauthenticated" });
+        const id = session.id;
+        const body = await readJson(req);
+        const medium = requireHex(body, "medium", HQC_PUBLIC_KEY_BYTES);
+
+        const raw = Array.isArray(body?.oneTime) ? body.oneTime : [];
+        if (raw.length > MAX_ONETIME_PER_UPLOAD) {
+          throw new HttpError(400, "TOO_MANY_PREKEYS",
+            `at most ${MAX_ONETIME_PER_UPLOAD} one-time prekeys per upload`);
+        }
+        const oneTime = raw.map((entry: unknown, i: number) => {
+          const item = entry as Record<string, unknown>;
+          const id = item?.id;
+          if (!Number.isInteger(id) || (id as number) < 0) {
+            throw new HttpError(400, "INVALID_FIELD", `oneTime[${i}].id must be a non-negative integer`);
+          }
+          return { id: id as number, prekey: requireHex(item, "prekey", HQC_PUBLIC_KEY_BYTES) };
+        });
+
+        await DB.putPrekeyBundle(id, medium, oneTime);
+        return send(res, 200, { ok: true, accepted: oneTime.length });
+      }
+
+      // Claim one prekey for a peer. POST rather than GET with the peer in the
+      // path — kept that way now that an id would fit in a URL, because the
+      // RESPONSE is key material and has no business in an access log or a proxy
+      // cache, and because a claim mutates (it consumes a one-time key).
+      if (method === "POST" && url === "/prekeys/claim") {
+        const session = await authSession(req);
+        if (!session) return send(res, 401, { error: "unauthenticated" });
+        const id = session.id;
+        const peer = requireString(await readJson(req), "peer", { max: MAX_PEER_IDENTIFIER });
+        const peerId = await DB.resolveToId(peer);
+        // Friendship is the authorization. Without it, anyone with a session could
+        // drain a stranger's one-time pool — a cheap way to force every one of
+        // their future conversations onto the reusable medium-term key.
+        if (!peerId || !(await DB.areFriends(id, peerId))) {
+          return send(res, 403, { error: "NOT_FRIENDS" });
+        }
+        const claimed = await DB.claimPrekey(peerId);
+        if (!claimed) return send(res, 404, { error: "NO_PREKEYS" });
+        return send(res, 200, claimed);
+      }
+
+      // How many one-time keys this account has left, so the client knows when to
+      // replenish. Only ever about the caller's own pool.
+      if (method === "GET" && url === "/prekeys/count") {
+        const session = await authSession(req);
+        if (!session) return send(res, 401, { error: "unauthenticated" });
+        const id = session.id;
+        return send(res, 200, {
+          remaining: await DB.countOneTimePrekeys(id),
+          maxId: await DB.maxOneTimePrekeyId(id),
+          target: MAX_ONETIME_PER_UPLOAD,
+        });
+      }
+
+      // --- Push token -------------------------------------------------------
+      if (method === "POST" && url === "/push/token") {
+        const session = await authSession(req);
+        if (!session) return send(res, 401, { error: "unauthenticated" });
+        const id = session.id;
+        const pushBody = await readJson(req);
+        const platform = requireString({ platform: pushBody.platform ?? "ios" }, "platform", { max: 16 });
+        const token = requireString(pushBody, "token", { min: 8, max: 512 });
+        await DB.setPushToken(id, platform, token);
+        return send(res, 200, { ok: true });
+      }
+
+      // --- Account deletion (purge + revoke MQTT + session tokens) ----------
+      if (method === "POST" && url === "/account/delete") {
+        const session = await authSession(req);
+        if (!session) return send(res, 401, { error: "unauthenticated" });
+        const id = session.id;
+        await DB.deleteUser(id);
+        await DB.revokeMqttAuth(id);
+        await DB.revokeSessionToken(bearer(req));
+        // Everything above stops the NEXT connect. This ends the current one —
+        // otherwise a deleted account keeps a live session, and its queued backlog,
+        // for as long as the connection happens to last. It also only started
+        // working when the client id stopped being a 14 kB URL path segment.
+        await EMQX.kick(id);
+        return send(res, 200, { ok: true });
+      }
+
+      return send(res, 404, { error: "not found" });
+    } catch (e) {
+      // A validation failure is the caller's problem and says which field; anything
+      // else is ours, and its detail goes to the log and Sentry rather than to the
+      // client. Previously every error came back as a 400 carrying its raw message,
+      // which leaked internals (database errors included) to whoever asked.
+      if (e instanceof HttpError) {
+        return send(res, e.status, { error: e.code, message: e.message });
+      }
+      logger.error(`[api] ${method} ${url} — ${(e as Error).message}`, e as Error);
+      return send(res, 500, { error: "INTERNAL" });
     }
-    logger.error(`[api] ${method} ${url} — ${(e as Error).message}`, e as Error);
-    return send(res, 500, { error: "INTERNAL" });
-  }
   };
 }
 
@@ -808,9 +809,9 @@ if (require.main === module) {
     logger.error(`[api] ${donationSummary(prices)}`);
   }
 
-  http.createServer(createApiHandler()).listen(PORT, () => {
+  listenOn(() => http.createServer(createApiHandler()), PORT, parseHosts(process.env.LISTEN_HOST), (host) => {
     logger.startup(
-      `📇 app-api on :${PORT} — REST directory/friends/push/account` +
+      `📇 app-api on ${host}:${PORT} — REST directory/friends/push/account` +
       (DONATIONS_ENABLED ? ` + ${donationSummary(prices)}` : "")
     );
   });

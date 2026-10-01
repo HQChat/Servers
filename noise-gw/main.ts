@@ -3,7 +3,9 @@
 // lib/noise.ts for the protocol.
 //
 //   NOISE_GW_PORT         listen port for clients                (8443)
+//   NOISE_GW_HOST         client listener address         (every interface)
 //   NOISE_GW_HEALTH_PORT  /health + counters, loopback-only use  (8081)
+//   NOISE_GW_HEALTH_HOST  comma-separated addresses for it  (every interface)
 //   NOISE_KEYS_FILE       secret seeds, see keys.ts              (required)
 //   EMQX_TCP_HOST/PORT    the broker's internal TCP listener     (emqx:1883)
 //   NOISE_GW_WORKERS      decapsulation workers         (cpus - 1, at least 1)
@@ -19,6 +21,7 @@ import { logger } from "../lib/logger";
 import { createGateway } from "./gateway";
 import { DecapPool } from "./decap-pool";
 import { readKeySeeds, loadServerKeys, publicKeys } from "./keys";
+import { listenOn, parseHosts } from "../lib/listen";
 
 if (require.main === module) {
   initObservability("noise-gw");
@@ -43,11 +46,16 @@ if (require.main === module) {
       if (e.t === "established") logger.debug(`[noise-gw] ${e.clientId?.slice(0, 12) ?? "?"}… from ${e.ip} in ${e.handshakeMs}ms`);
     },
   });
-  server.listen(port, () => {
-    logger.startup(`🔒 noise-gw on :${port} — keys ${[...keys.keys()].join(",")}, ${pool.size} decap workers`);
+  // NOISE_GW_HOST: the reserved IP's anchor address, off Docker — the only
+  // address the world may reach. Unset = every interface (compose publishes it).
+  const host = process.env.NOISE_GW_HOST || undefined;
+  server.listen(port, host, () => {
+    logger.startup(`🔒 noise-gw on ${host ?? "*"}:${port} — keys ${[...keys.keys()].join(",")}, ${pool.size} decap workers`);
   });
 
-  http.createServer((req, res) => {
+  // /health and /keys: loopback (the host's health gate) and the WireGuard
+  // address (auth reads /keys), never the public one. A list, like LISTEN_HOST.
+  listenOn(() => http.createServer((req, res) => {
     if (req.url === "/health") {
       res.writeHead(200, { "content-type": "application/json" });
       return res.end(JSON.stringify({ ok: true, service: "noise-gw", ...stats(), decapQueued: pool.queued }));
@@ -57,7 +65,7 @@ if (require.main === module) {
       return res.end(JSON.stringify({ keys: publicKeys(keys) }));
     }
     res.writeHead(404).end();
-  }).listen(healthPort);
+  }), healthPort, parseHosts(process.env.NOISE_GW_HEALTH_HOST));
 
   healthMonitor.start();
 }

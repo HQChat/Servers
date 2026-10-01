@@ -331,29 +331,10 @@ const DBImpl = {
    */
   async deleteUser(id: string): Promise<void> {
     await tx(async (c) => {
-      // Each friend also holds ACL rows naming this user: the shared
-      // conversation topic and this user's presence topic. Without removing
-      // them the deleted account's grants survive, and every friend keeps a
-      // dangling entry for an id that no longer exists.
-      const { rows: peers } = await c.query<{ peer: string; hash: string }>(
-        `SELECT CASE WHEN id_lo = $1 THEN id_hi ELSE id_lo END AS peer, hash
-           FROM friendships WHERE id_lo = $1 OR id_hi = $1`,
-        [id]
-      );
-      for (const { peer, hash } of peers) {
-        await c.query(`DELETE FROM mqtt_acl WHERE id = $1 AND topic = ANY($2::text[])`, [
-          peer,
-          // Every topic of THIS user that a peer holds a grant on — the shared
-          // conversation, this user's presence, and (since 003) this user's
-          // inbox. Missing one leaves the peer a dangling grant on an id that no
-          // longer exists.
-          [`c/${hash}`, this.presenceTopic(id), this.inboxTopic(id)],
-        ]);
-      }
-
+      // The friendships go, and with them their topic ids: nobody is handed
+      // them again, so a friend's subscription to one goes quiet.
       await c.query(`DELETE FROM friendships WHERE id_lo = $1 OR id_hi = $1`, [id]);
       await c.query(`DELETE FROM invites WHERE to_id = $1 OR from_id = $1`, [id]);
-      await c.query(`DELETE FROM mqtt_acl WHERE id = $1`, [id]);
       // MQTT connect credential + every live REST bearer.
       await c.query(`DELETE FROM mqtt_tokens WHERE id = $1`, [id]);
       await c.query(`DELETE FROM mqtt_session_keys WHERE id = $1`, [id]);
@@ -562,8 +543,8 @@ const DBImpl = {
    * verifies it against the id before pinning it.
    */
   async getFriendsList(myId: string) {
-    const res = await q<{ id: string; username: string | null }>(
-      `SELECT peer.id, u.username::text AS username
+    const res = await q<{ id: string; username: string | null; convo_id: string; handshake_id: string }>(
+      `SELECT peer.id, u.username::text AS username, f.convo_id, f.handshake_id
          FROM friendships f
          CROSS JOIN LATERAL (
            SELECT CASE WHEN f.id_lo = $1 THEN f.id_hi ELSE f.id_lo END AS id
@@ -575,7 +556,26 @@ const DBImpl = {
     // NULL rather than 'Anonymous', for the same reason getMyInvites returns
     // null: a shared placeholder name is indistinguishable from a re-keyed
     // contact to the client's username-fallback detection.
-    return res.rows.map((r) => ({ id: r.id, username: r.username ?? null }));
+    //
+    // `convo_id` and `handshake_id` are the friendship's topic capabilities
+    // (009_friendship_topics.sql): the client subscribes to `cv/{convo_id}` and
+    // `hs/{handshake_id}`, and knowing them is all the broker asks. This
+    // authenticated route is the only place they leave the server.
+    return res.rows.map((r) => ({
+      id: r.id,
+      username: r.username ?? null,
+      convo_id: r.convo_id,
+      handshake_id: r.handshake_id,
+    }));
+  },
+
+  /** One friendship's topic ids, or null when the pair are not friends. */
+  async getFriendshipTopics(idA: string, idB: string): Promise<{ convoId: string; handshakeId: string } | null> {
+    const [lo, hi] = pair(idA, idB);
+    const row = await one<{ convo_id: string; handshake_id: string }>(
+      `SELECT convo_id, handshake_id FROM friendships WHERE id_lo = $1 AND id_hi = $2`, [lo, hi]
+    );
+    return row ? { convoId: row.convo_id, handshakeId: row.handshake_id } : null;
   },
 
   /**
@@ -593,7 +593,7 @@ const DBImpl = {
     return Number(row?.n ?? 0);
   },
 
-  /** Just the peers, for the ACL walks below. */
+  /** Just the peers. */
   async friendIds(myId: string): Promise<string[]> {
     const res = await q<{ id: string }>(
       `SELECT CASE WHEN id_lo = $1 THEN id_hi ELSE id_lo END AS id
@@ -618,6 +618,20 @@ const DBImpl = {
     const [lo, hi] = pair(fromId, toId);
     const res = await q(`DELETE FROM friendships WHERE id_lo = $1 AND id_hi = $2`, [lo, hi]);
     return (res.rowCount ?? 0) > 0;
+  },
+
+  /**
+   * `removeFriend`, returning the topic ids the friendship held — the caller
+   * needs them to drop the live subscriptions, and after the DELETE nothing
+   * else can say what they were. Null when the pair were not friends.
+   */
+  async removeFriendTopics(fromId: string, toId: string): Promise<{ convoId: string; handshakeId: string } | null> {
+    const [lo, hi] = pair(fromId, toId);
+    const row = await one<{ convo_id: string; handshake_id: string }>(
+      `DELETE FROM friendships WHERE id_lo = $1 AND id_hi = $2 RETURNING convo_id, handshake_id`,
+      [lo, hi]
+    );
+    return row ? { convoId: row.convo_id, handshakeId: row.handshake_id } : null;
   },
 
   async createFriendship(id1: string, id2: string) {
@@ -960,162 +974,18 @@ const DBImpl = {
   },
 
   // ============================================================
-  // 5. MQTT AUTHORIZATION (RLS) — friend-hash topic ACL
+  // 5. MQTT TOPICS — who is behind one
   // ============================================================
   //
-  // Each conversation is a topic `c/{friendshipHash}`. EMQX's PostgreSQL
-  // authorizer reads `mqtt_acl` for the connecting clientid (see
-  // infra/deploy/emqx/emqx.conf) — with a 15m cache in front, so this is not a
-  // per-message lookup. We grant the topic to BOTH members when a friendship
-  // forms and revoke it when it ends, and revocation ALSO acts on the live
-  // connection through lib/emqx.ts rather than waiting for the cache.
-  //
-  // The topic name is derivable by anyone who knows both identifiers, so
-  // security rests ENTIRELY on this table — never on topic-name secrecy.
-  //
-  // Every topic here names CLIENT IDS, not public keys. A presence topic was
-  // `u/{14474 hex}/presence`, so an ACL row carried a key in `pk` and another
-  // inside `topic`: ~29 kB to record one membership bit. It is ~140 bytes now,
-  // and — the part that actually failed — a topic short enough that
-  // `DELETE /clients/{id}/subscriptions/{topic}` fits in a URL, which is what
-  // makes unfriending stop a LIVE subscription instead of only the next one.
+  // There is no topic ACL in the database any more. The broker authorizes from
+  // a static file (infra/deploy/emqx/acl.conf): per-user topics keyed on the
+  // authenticated clientid, and conversation/handshake topics that name random
+  // per-friendship ids (009_friendship_topics.sql) — knowing the id is the
+  // permission. So nothing here grants or revokes; unfriending deletes the row,
+  // which retires its ids. What remains is answering who a topic belongs to.
 
-  /** Conversation topic between two client ids. */
-  mqttTopicFor(id1: string, id2: string): string {
-    return `c/${friendshipHash(id1, id2)}`;
-  },
-
-  /** A client's own presence + inbox topics. Presence: owner publishes (retained
-   *  + LWT), friends subscribe. Inbox: owner subscribes (offline wake target). */
-  presenceTopic(id: string): string { return `u/${id}/presence`; },
-  inboxTopic(id: string): string { return `u/${id}/inbox`; },
-  /** Where the server tells this account its friend graph moved. Owner-only:
-   *  nobody else is ever granted anything on it, and the server publishes
-   *  through the admin API rather than as a client. */
-  graphTopic(id: string): string { return `u/${id}/graph`; },
-
-  /**
-   * Where two friends prove to each other that an `init` came from the peer it
-   * names. Derived from the friendship, exactly like the conversation topic, so
-   * there is nothing to create, expire or clean up.
-   *
-   * It is a SEPARATE topic rather than the inbox because the inbox is the one
-   * place every friend may publish: a challenge sitting there would be visible
-   * to — and forgeable by — precisely the attacker this exchange exists to stop.
-   * Only the two members are granted here, which is what keeps a third party
-   * from ever seeing the challenge it would need to relay.
-   */
-  handshakeTopic(idA: string, idB: string): string {
-    return `h/${friendshipHash(idA, idB)}`;
-  },
-
-  /** Grant a client the topics it owns: publish on its presence, all on its
-   *  inbox. Idempotent; call on user creation and (harmlessly) on each token
-   *  mint. */
-  async grantSelfTopics(id: string): Promise<void> {
-    await this.grant([
-      [id, this.presenceTopic(id), 'publish'],
-      [id, this.inboxTopic(id), 'all'],
-      // SUBSCRIBE only. The account listens for "your graph changed"; the server
-      // is the only publisher, and it publishes through the admin API, which the
-      // authorizer does not consult. So no row grants anyone `publish` here —
-      // not even the owner, who has no reason to tell themselves anything.
-      [id, this.graphTopic(id), 'subscribe'],
-    ]);
-  },
-
-  /** Grant both members everything they need for a friendship: pub/sub on the
-   *  shared conversation topic, subscribe on each other's presence, and PUBLISH
-   *  on each other's inbox. Idempotent. (The topic's membership no longer needs
-   *  recording separately — `friendships.hash` already answers it; see
-   *  getHashMembers.)
-   *
-   *  The inbox grant is what makes first contact work while the peer is offline.
-   *  MQTT drops a publish to a topic nobody has subscribed to yet, so the old
-   *  key-agreement offer — sent on the conversation topic — vanished whenever the
-   *  peer had not connected since the friendship formed, and the client papered
-   *  over it with a 15s directory poll. The inbox is subscribed on every connect
-   *  with `cleanSession = false`, so the broker QUEUES for an offline peer
-   *  instead. The `init` frame goes there; everything after it stays on the
-   *  conversation topic.
-   *
-   *  This does not widen the trust boundary: a friend can already publish to the
-   *  shared conversation topic, and the inbox carries the same ciphertext. It is
-   *  scoped to friends — `grantSelfTopics` gives the owner 'all' on their own
-   *  inbox, and nobody else gets a row without a friendship. */
-  async grantFriendTopic(idA: string, idB: string): Promise<void> {
-    const convo = `c/${friendshipHash(idA, idB)}`;
-    const handshake = this.handshakeTopic(idA, idB);
-    await this.grant([
-      [idA, convo, 'all'],
-      [idA, this.presenceTopic(idB), 'subscribe'],
-      [idA, this.inboxTopic(idB), 'publish'],
-      // Both members read and write the handshake topic, and nobody else is
-      // granted it at all — see `handshakeTopic`.
-      [idA, handshake, 'all'],
-      [idB, convo, 'all'],
-      [idB, this.presenceTopic(idA), 'subscribe'],
-      [idB, this.inboxTopic(idA), 'publish'],
-      [idB, handshake, 'all'],
-    ]);
-  },
-
-  /** Write a batch of (id, topic, action) grants in one statement. */
-  async grant(rows: Array<[string, string, string]>): Promise<void> {
-    await q(
-      `INSERT INTO mqtt_acl (id, topic, action)
-       SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
-       ON CONFLICT (id, topic) DO UPDATE SET action = EXCLUDED.action`,
-      [rows.map((r) => r[0]), rows.map((r) => r[1]), rows.map((r) => r[2])]
-    );
-  },
-
-  /** Revoke both members' friendship topics (conversation + each other's
-   *  presence). Idempotent. Callers should ALSO kick any live subscription via
-   *  the EMQX API — the row edit only affects the NEXT authorization check that
-   *  misses the cache, not an already-open subscription. */
-  async revokeFriendTopic(idA: string, idB: string): Promise<void> {
-    const convo = `c/${friendshipHash(idA, idB)}`;
-    const handshake = this.handshakeTopic(idA, idB);
-    await q(
-      `DELETE FROM mqtt_acl
-        WHERE (id = $1 AND topic = ANY($3::text[]))
-           OR (id = $2 AND topic = ANY($4::text[]))`,
-      [
-        idA,
-        idB,
-        // Mirror of grantFriendTopic — the inbox publish grant must come back out
-        // with the friendship, or an unfriended peer keeps a channel to wake this
-        // device with `init` frames it will no longer answer. Same for the
-        // handshake topic, which is the channel that would let them try again.
-        [convo, this.presenceTopic(idB), this.inboxTopic(idB), handshake],
-        [convo, this.presenceTopic(idA), this.inboxTopic(idA), handshake],
-      ]
-    );
-  },
-
-  /** Re-grant every friend topic this pk is entitled to. A lapsed subscription
-   *  revokes them - a paywall has to bite on the live session, not only on the
-   *  next one - and resubscribing has to put them back. The friend list was
-   *  never deleted, so it is the record of what to restore. */
-  async regrantAllFriendTopics(id: string): Promise<number> {
-    const friends = await this.friendIds(id);
-    for (const peer of friends) await this.grantFriendTopic(id, peer);
-    return friends.length;
-  },
-
-  /** Revoke every friend topic except `keepId` (the helper bot, which the free
-   *  tier keeps). Returns the peers revoked so the caller can ALSO drop their
-   *  live subscriptions via the EMQX API. */
-  async revokeAllFriendTopics(id: string, keepId?: string): Promise<string[]> {
-    const friends = (await this.friendIds(id)).filter((p) => p !== keepId);
-    for (const peer of friends) await this.revokeFriendTopic(id, peer);
-    return friends;
-  },
-
-  /** The two client ids that share a conversation hash (for push-bridge).
-   *  Answered from the friendship itself — `hashmembers:{h}` was a third copy of
-   *  a fact the edge already carried, and one more thing to keep in sync. */
+  /** The two client ids behind a friendship hash — how `/report` checks the
+   *  reporter is in the conversation it names. The hash is no longer a topic. */
   async getHashMembers(hash: string): Promise<string[]> {
     const row = await one<{ id_lo: string; id_hi: string }>(
       `SELECT id_lo, id_hi FROM friendships WHERE hash = $1`, [hash]
@@ -1123,10 +993,12 @@ const DBImpl = {
     return row ? [row.id_lo, row.id_hi] : [];
   },
 
-  /** All topics a client may access (for repair/debugging). */
-  async getAclTopics(id: string): Promise<string[]> {
-    const res = await q<{ topic: string }>(`SELECT topic FROM mqtt_acl WHERE id = $1`, [id]);
-    return res.rows.map((r) => r.topic);
+  /** The two client ids behind a `cv/{convo_id}` topic (for push-bridge). */
+  async getTopicMembers(convoId: string): Promise<string[]> {
+    const row = await one<{ id_lo: string; id_hi: string }>(
+      `SELECT id_lo, id_hi FROM friendships WHERE convo_id = $1`, [convoId]
+    );
+    return row ? [row.id_lo, row.id_hi] : [];
   },
 
   // ============================================================

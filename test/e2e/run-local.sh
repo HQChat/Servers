@@ -22,6 +22,7 @@ MQTT_PORT="${MQTT_PORT:-58083}"
 API_PORT="${API_PORT:-58080}"
 AUTH_PORT="${AUTH_PORT:-58081}"
 MQTT_TCP_PORT="${MQTT_TCP_PORT:-51883}"
+EMQX_API_PORT="${EMQX_API_PORT:-58084}"
 HQN_PORT="${HQN_PORT:-58443}"
 HQN_HEALTH_PORT="${HQN_HEALTH_PORT:-58444}"
 NAME_PG="hqcat-e2e-pg"
@@ -66,24 +67,22 @@ export ADMISSION_POLICY=open
 step "Migrate"
 npm run migrate
 
-# The broker runs the REAL config, rendered exactly as CI renders it — see the
-# long note in .github/workflows/ci.yml for why each substitution differs from
-# production. The short version: CI and this script reach Postgres directly,
-# production reaches it through PgBouncer, and `disable_prepared_statements`
-# has to flip for that.
-step "EMQX (with the deployment's authorizer)"
+# The broker runs the REAL config and ACL — see .github/workflows/ci.yml. The
+# one substitution points the auth hooks (public and internal) at this host.
+step "EMQX (with the deployment's static ACL)"
 HOST_GW="host.docker.internal"
-sed -e "s|__PG_SERVER__|${HOST_GW}:${PG_PORT}|" \
-    -e "s|__PG_HOST__|${HOST_GW}|" \
-    -e "s|__PG_DATABASE__|hqcat|" \
-    -e "s|__PG_USERNAME__|hqcat|" \
-    -e "s|__PG_PASSWORD__|hqcat|" \
-    -e "s|__PG_SSL__|false|" \
-    -e "/cacertfile = /d" \
-    -e "s|disable_prepared_statements = true|disable_prepared_statements = false|" \
-    -e "s|//auth:8080/mqtt/authn|//${HOST_GW}:${AUTH_PORT}/mqtt/authn|" \
+sed -e "s|//auth:8080/mqtt/authn|//${HOST_GW}:${AUTH_PORT}/mqtt/authn|" \
     "$ROOT/infra/deploy/emqx/emqx.conf" > /tmp/hqcat-e2e-emqx.conf
-grep -q "__PG_" /tmp/hqcat-e2e-emqx.conf && { echo "❌ unrendered placeholders"; exit 1; } || true
+# The API drops a live subscription on unfriend through EMQX's admin API; the
+# unfriend e2e test is about exactly that, so the API needs the credential.
+export EMQX_API_URL="http://localhost:${EMQX_API_PORT}"
+export EMQX_DASHBOARD_PASSWORD="e2e-dashboard"
+# The API key is what the deployment uses and what lib/emqx-api.ts prefers, so
+# the unfriend/kick paths run on it here too. The broker loads the same pair.
+export EMQX_API_KEY="hqcat-svc"
+export EMQX_API_SECRET="e2e-api-secret"
+printf '%s:%s\n' "$EMQX_API_KEY" "$EMQX_API_SECRET" > /tmp/hqcat-e2e-emqx-api-bootstrap
+chmod 644 /tmp/hqcat-e2e-emqx-api-bootstrap
 
 # The API and auth start FIRST: EMQX's authn webhook fails its initial connect
 # otherwise, marks the resource down, and refuses every CONNECT until it retries.
@@ -121,7 +120,13 @@ docker run -d --name "$NAME_MQ" \
   --add-host "${HOST_GW}:host-gateway" \
   -p "${MQTT_PORT}:8083" \
   -p "${MQTT_TCP_PORT}:1883" \
+  -p "${EMQX_API_PORT}:18083" \
+  -e EMQX_DASHBOARD__DEFAULT_PASSWORD="$EMQX_DASHBOARD_PASSWORD" \
+  -e EMQX_NODE__COOKIE="$(openssl rand -hex 16)" \
+  -e EMQX_API_KEY__BOOTSTRAP_FILE=/opt/emqx/etc/api-bootstrap \
+  -v /tmp/hqcat-e2e-emqx-api-bootstrap:/opt/emqx/etc/api-bootstrap:ro \
   -v /tmp/hqcat-e2e-emqx.conf:/opt/emqx/etc/emqx.conf:ro \
+  -v "$ROOT/infra/deploy/emqx/acl.conf:/opt/emqx/etc/dissqus-acl.conf:ro" \
   emqx/emqx:5.8 >/dev/null
 for _ in $(seq 1 40); do
   docker exec "$NAME_MQ" emqx ctl status >/dev/null 2>&1 && break
@@ -131,7 +136,7 @@ docker exec "$NAME_MQ" emqx ctl status >/dev/null \
   || { echo "❌ emqx did not start"; docker logs "$NAME_MQ"; exit 1; }
 for _ in $(seq 1 30); do
   docker exec "$NAME_MQ" emqx ctl alarms list 2>/dev/null \
-    | grep -qiE "authn|authz|resource" || break
+    | grep -qiE "authn|resource" || break
   echo "waiting for the auth resources…"; sleep 2
 done
 

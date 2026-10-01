@@ -18,7 +18,7 @@ import mqtt, { type MqttClient } from "mqtt";
 import * as crypto from "crypto";
 import { authProof } from "../../lib/auth-proof";
 import { newSigningKey, signConnect } from "../../lib/mqtt-proof";
-import { friendshipHash } from "../../lib/crypto-utils";
+import { conversationTopic, handshakeTopic, TOPIC_ID } from "../../lib/topics";
 import { keyMatchesId, peerId } from "../../lib/identity";
 import {
   Kem,
@@ -140,6 +140,14 @@ export class TestClient {
    *  elsewhere, or failed to open. That silence is why this suite was
    *  undiagnosable the whole time it was skipping. */
   readonly drops: string[] = [];
+
+  /**
+   * Each friendship's topic ids, as /friends hands them out. Conversation
+   * topics are random per friendship (009_friendship_topics.sql) and cannot be
+   * derived, so a test that has not synced has no topic to use — exactly like
+   * the real clients.
+   */
+  private readonly topicIds = new Map<string, { convoId: string; handshakeId: string }>();
 
   private readonly c: Crypto;
 
@@ -276,7 +284,35 @@ export class TestClient {
   }
 
   /** Subscribe, and always settle — same disconnect hazard as `publishRaw`. */
-  subscribeConversation(peerId_: string): Promise<void> {
+  /** Pull /friends and remember every friendship's topic ids. */
+  async syncFriends(): Promise<void> {
+    const res = await this.api("GET", "/friends");
+    if (res.status !== 200) throw new Error(`/friends returned ${res.status}`);
+    for (const f of (res.body?.friends ?? []) as Array<{ id: string; convo_id: string; handshake_id: string }>) {
+      if (!TOPIC_ID.test(f.convo_id) || !TOPIC_ID.test(f.handshake_id)) {
+        throw new Error(`/friends gave malformed topic ids for ${f.id.slice(0, 8)}…`);
+      }
+      this.topicIds.set(f.id, { convoId: f.convo_id, handshakeId: f.handshake_id });
+    }
+  }
+
+  /** The conversation topic with a peer. Throws before a sync names it. */
+  conversationWith(peerId_: string): string {
+    const ids = this.topicIds.get(peerId_);
+    if (!ids) throw new Error(`no topic ids for ${peerId_.slice(0, 8)}… — call syncFriends() first`);
+    return conversationTopic(ids.convoId);
+  }
+
+  /** The handshake topic with a peer. Throws before a sync names it. */
+  handshakeWith(peerId_: string): string {
+    const ids = this.topicIds.get(peerId_);
+    if (!ids) throw new Error(`no topic ids for ${peerId_.slice(0, 8)}… — call syncFriends() first`);
+    return handshakeTopic(ids.handshakeId);
+  }
+
+  async subscribeConversation(peerId_: string): Promise<void> {
+    if (!this.topicIds.has(peerId_)) await this.syncFriends();
+    const topic = this.conversationWith(peerId_);
     return new Promise((resolve, reject) => {
       const c = this.client;
       if (!c) return reject(new NotAvailable("not connected"));
@@ -291,9 +327,13 @@ export class TestClient {
       const onGone = () => finish(new NotAvailable("broker closed the connection during SUBSCRIBE"));
       const timer = setTimeout(() => finish(new NotAvailable("SUBSCRIBE timed out")), 5000);
       c.once("close", onGone);
-      c.subscribe(`c/${friendshipHash(this.id, peerId_)}`, { qos: 1 }, (err) =>
-        finish(err ?? undefined)
-      );
+      c.subscribe(topic, { qos: 1 }, (err, granted) => {
+        // A refusal arrives in the SUBACK, not as an error.
+        if (!err && granted?.some((g) => g.qos >= 128)) {
+          return finish(new Error(`SUBSCRIBE ${topic} refused`));
+        }
+        finish(err ?? undefined);
+      });
     });
   }
 
@@ -337,6 +377,21 @@ export class TestClient {
    * So a close or an error settles it as a refusal, which is what a refusal
    * looks like on this broker, and a timeout backstops both.
    */
+  /** Subscribe to an arbitrary filter and report whether the broker GRANTED it
+   *  — a refusal is a SUBACK reason code >= 0x80, not an error. For tests that
+   *  probe the ACL; the conversation path is `subscribeConversation`. */
+  subscribeRaw(filter: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const c = this.client;
+      if (!c) return resolve(false);
+      const timer = setTimeout(() => resolve(false), 5000);
+      c.subscribe(filter, { qos: 1 }, (err, granted) => {
+        clearTimeout(timer);
+        resolve(!err && !!granted?.length && granted.every((g) => g.qos < 128));
+      });
+    });
+  }
+
   publishRaw(topic: string, payload: string | Buffer): Promise<{ accepted: boolean; reason?: number }> {
     return new Promise((resolve) => {
       const c = this.client;
@@ -454,13 +509,13 @@ export class TestClient {
    *
    * Exposed because a test that publishes by hand — to reorder, delay or tamper
    * — has to obey the same rule, and one that hand-rolled the topic instead
-   * sent three inits to `c/…` and watched all three be dropped as
+   * sent three inits to `cv/…` and watched all three be dropped as
    * "arrived on the wrong topic".
    */
   topicFor(env: Frame, peer: TestClient): string {
     return env.t === "init"
       ? `u/${peer.id}/inbox`
-      : `c/${friendshipHash(this.id, peer.id)}`;
+      : this.conversationWith(peer.id);
   }
 
   async send(peer: TestClient, text: string): Promise<Frame> {
@@ -494,9 +549,13 @@ export class TestClient {
       return;
     }
 
-    const expected = env.t === "init"
-      ? `u/${this.id}/inbox`
-      : `c/${friendshipHash(this.id, env.sender)}`;
+    let expected: string;
+    try {
+      expected = env.t === "init" ? `u/${this.id}/inbox` : this.conversationWith(env.sender);
+    } catch {
+      this.drops.push(`t=${env.t} from ${env.sender.slice(0, 8)}…, whose topic ids we never synced`);
+      return;
+    }
     if (topic !== expected) {
       this.drops.push(`t=${env.t} arrived on ${topic}, expected ${expected}`);
       return;

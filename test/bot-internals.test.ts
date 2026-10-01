@@ -5,63 +5,64 @@
 // persistence that every conversation depends on surviving a restart. The boot
 // is behind `require.main === module` now, so the pure half is reachable.
 //
-// THE TOPIC SCHEME IS SPELLED OUT FOUR TIMES. services/db/api.ts grants the ACL
-// rows, apps/apple MQTTTopics.swift builds the client's, the two ops scripts
-// derive them for repair and report — and this file builds the bot's. The
-// previous round found two of those copies had drifted and left the handshake
-// topic ungranted, so this is a differential against the writers rather than a
-// fifth restatement.
+// Topics: the per-user ones are spelled by lib/topics.ts, which is what the
+// broker's static ACL (infra/deploy/emqx/acl.conf) is written against. The
+// conversation and handshake topics are NOT derived at all — they name random
+// ids the bot learns from /friends — so what is tested is that it uses exactly
+// the ids it was given, and nothing before it has them.
 
 import "./helpers/bot-env";
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DB } from "../services/db/api";
-import { friendshipHash } from "../lib/crypto-utils";
+import * as topics from "../lib/topics";
 import { peerId } from "../lib/identity";
 import * as crypto from "node:crypto";
 import * as bot from "../bot/bot";
 
 const peer = () => peerId(crypto.randomBytes(64).toString("hex"));
+const topicId = () => crypto.randomBytes(32).toString("hex");
 
-// --- the fourth copy of the topic scheme ---------------------------------------------
+// --- topics ------------------------------------------------------------------
 
-test("the bot derives the same topics the server grants", async () => {
-  // If these disagree the bot publishes where nobody is listening, or subscribes
-  // to a topic it was never granted and is disconnected by `deny_action`. Both
-  // present as "the helper bot stopped replying", with nothing in either log
-  // saying which topic was wrong.
-  for (let i = 0; i < 50; i++) {
+test("the bot's per-user topics are the ones the static ACL is written for", () => {
+  // acl.conf keys these on the clientid; a different spelling is refused, and
+  // with the inbox that means no first contact ever arrives.
+  for (let i = 0; i < 20; i++) {
     const p = peer();
-    assert.equal(bot.convoTopic(p), `c/${friendshipHash(bot.myId, p)}`);
-    assert.equal(bot.inboxTopic(p), DB.inboxTopic(p),
-      "the bot's idea of a peer's inbox differs from the one the ACL grants");
-    assert.equal(bot.handshakeTopic(p), DB.handshakeTopic(bot.myId, p),
-      "the bot's handshake topic differs from the one the ACL grants");
+    assert.equal(bot.inboxTopic(p), topics.inboxTopic(p));
   }
-  assert.equal(bot.PRESENCE_TOPIC, DB.presenceTopic(bot.myId));
+  assert.equal(bot.PRESENCE_TOPIC, topics.presenceTopic(bot.myId));
 });
 
-test("the conversation and handshake topics share a hash but not a prefix", async () => {
-  // Same friendship, two topics. The separation is the point: every friend may
-  // publish to an inbox, so a challenge sitting there would be forgeable by
-  // exactly the attacker the exchange exists to stop.
+test("conversation and handshake topics are the ids /friends handed out, verbatim", () => {
   const p = peer();
-  const convo = bot.convoTopic(p);
-  const shake = bot.handshakeTopic(p);
-  assert.ok(convo.startsWith("c/"));
-  assert.ok(shake.startsWith("h/"));
-  assert.equal(convo.slice(2), shake.slice(2), "the two must name the same friendship");
-  assert.notEqual(convo, shake);
+  const convoId = topicId(), handshakeId = topicId();
+  bot.state.friends[p] = { id: p, convoId, handshakeId };
+  try {
+    assert.equal(bot.convoTopic(p), topics.conversationTopic(convoId));
+    assert.equal(bot.handshakeTopic(p), topics.handshakeTopic(handshakeId));
+    assert.equal(bot.convoTopic(p), `cv/${convoId}`);
+    assert.equal(bot.handshakeTopic(p), `hs/${handshakeId}`);
+  } finally {
+    delete bot.state.friends[p];
+  }
 });
 
-test("topic derivation is order-independent", async () => {
-  // Both sides compute it from the unordered pair, or the two ends of one
-  // conversation would sit on different topics and neither would ever hear the
-  // other.
+test("a peer with no synced ids has no topic — nothing is guessed", () => {
+  // The old scheme derived a topic from the two ids, so there was always one to
+  // use. There is none now until /friends names it, and publishing to a guess
+  // would be publishing to nobody.
   const p = peer();
-  assert.equal(bot.convoTopic(p), `c/${friendshipHash(p, bot.myId)}`);
-  assert.equal(bot.handshakeTopic(p), DB.handshakeTopic(p, bot.myId));
+  assert.equal(bot.convoTopic(p), null);
+  assert.equal(bot.handshakeTopic(p), null);
+  bot.state.friends[p] = { id: p };
+  try {
+    assert.equal(bot.convoTopic(p), null);
+    assert.equal(bot.handshakeTopic(p), null);
+  } finally {
+    delete bot.state.friends[p];
+  }
 });
 
 test("the bot's own id names its own key", async () => {

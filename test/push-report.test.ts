@@ -103,7 +103,7 @@ function bridgeThatAnswers(
 ) {
   const sent: string[] = [];
   const bridge = push.createPushBridge({
-    getHashMembers: async () => members,
+    getTopicMembers: async () => members,
     send: async (to) => {
       sent.push(to);
       return typeof outcome === "function" ? outcome(to) : outcome;
@@ -123,7 +123,7 @@ for (const outcome of GLOBAL) {
       const { bridge, sent } = bridgeThatAnswers(push, outcome, members);
       warns.length = 0;
 
-      await bridge.handleMessage(`c/${hash()}`, Buffer.from("x"));
+      await bridge.handleMessage(`cv/${hash()}`, Buffer.from("x"));
       assert.equal(sent.length, 50, "every offline member is still attempted");
 
       const said = warns.filter((l) => l.includes(outcome));
@@ -135,7 +135,7 @@ for (const outcome of GLOBAL) {
       assert.match(said[0]!, /check-push/);
 
       // And a SECOND conversation does not re-say it.
-      await bridge.handleMessage(`c/${hash()}`, Buffer.from("x"));
+      await bridge.handleMessage(`cv/${hash()}`, Buffer.from("x"));
       assert.equal(warns.filter((l) => l.includes(outcome)).length, 1,
         "the next conversation repeated it");
     });
@@ -153,7 +153,7 @@ test("a rejected token is reported per install, not once for everybody", async (
     const { bridge } = bridgeThatAnswers(push, "rejected", [a, b, c]);
     warns.length = 0;
 
-    await bridge.handleMessage(`c/${hash()}`, Buffer.from("x"));
+    await bridge.handleMessage(`cv/${hash()}`, Buffer.from("x"));
     const said = warns.filter((l) => /could not wake/.test(l));
     assert.equal(said.length, 3, `three broken devices produced ${said.length} lines`);
   });
@@ -165,7 +165,7 @@ test("…but the same device is not reported on every message", async () => {
     const { bridge } = bridgeThatAnswers(push, "error", [only]);
     warns.length = 0;
 
-    for (let i = 0; i < 20; i++) await bridge.handleMessage(`c/${hash()}`, Buffer.from("x"));
+    for (let i = 0; i < 20; i++) await bridge.handleMessage(`cv/${hash()}`, Buffer.from("x"));
     const said = warns.filter((l) => /could not wake/.test(l));
     assert.equal(said.length, 1, `20 messages to one broken device produced ${said.length} lines`);
   });
@@ -178,14 +178,14 @@ test("rejected and error are different reasons for the same device", async () =>
     const only = id();
     let outcome: SendOutcome = "rejected";
     const bridge = push.createPushBridge({
-      getHashMembers: async () => [only],
+      getTopicMembers: async () => [only],
       send: async () => outcome,
     }, new Set());
     warns.length = 0;
 
-    await bridge.handleMessage(`c/${hash()}`, Buffer.from("x"));
+    await bridge.handleMessage(`cv/${hash()}`, Buffer.from("x"));
     outcome = "error";
-    await bridge.handleMessage(`c/${hash()}`, Buffer.from("x"));
+    await bridge.handleMessage(`cv/${hash()}`, Buffer.from("x"));
     assert.equal(warns.filter((l) => /could not wake/.test(l)).length, 2, warns.join("\n"));
   });
 });
@@ -201,7 +201,7 @@ test("a successful wake and a peer with no token are not warnings", async () => 
     const { bridge } = bridgeThatAnswers(push, (to) => (to === a ? "sent" : "no-token"), [a, b]);
     warns.length = 0;
 
-    await bridge.handleMessage(`c/${hash()}`, Buffer.from("x"));
+    await bridge.handleMessage(`cv/${hash()}`, Buffer.from("x"));
     assert.deepEqual(warns, [], `an ordinary outcome was warned about:\n${warns.join("\n")}`);
     // They are still visible at debug, which is where "why did my phone not
     // buzz" is actually answered.
@@ -220,7 +220,7 @@ test("a client id is truncated everywhere it is logged", async () => {
     const full = id();
     const { bridge } = bridgeThatAnswers(push, "rejected", [full]);
     log.length = 0;
-    await bridge.handleMessage(`c/${hash()}`, Buffer.from("x"));
+    await bridge.handleMessage(`cv/${hash()}`, Buffer.from("x"));
 
     const all = log.join("\n");
     assert.ok(all.includes(`${full.slice(0, 8)}…`), `expected a short id; got:\n${all}`);
@@ -228,29 +228,30 @@ test("a client id is truncated everywhere it is logged", async () => {
   });
 });
 
-test("an unknown conversation hash is reported once per hash", async () => {
-  // The bridge parses a topic the broker AUTHORIZED, so an unknown hash means
-  // the friendship row and the topic scheme disagree. Once per hash: it would
-  // otherwise repeat for every message in a conversation that is going to keep
-  // having them — but a second broken hash is a second fact.
+test("an unknown conversation id is reported once per id", async () => {
+  // Either a retired topic an ex-friend still publishes to, or the client and
+  // friendships.convo_id disagreeing. Once per id: it would otherwise repeat for
+  // every message on a topic that is going to keep having them — but a second
+  // unknown id is a second fact.
   await withPush(CONFIGURED, async ({ push, warns }) => {
     const bridge = push.createPushBridge({
-      getHashMembers: async () => [],
+      getTopicMembers: async () => [],
       send: async () => "sent" as SendOutcome,
     }, new Set());
     warns.length = 0;
 
     const [h1, h2] = [hash(), hash()];
-    for (let i = 0; i < 5; i++) await bridge.handleMessage(`c/${h1}`, Buffer.from("x"));
-    assert.equal(warns.filter((l) => /no friendship row/.test(l)).length, 1,
-      "five messages on one broken hash produced more than one line");
+    for (let i = 0; i < 5; i++) await bridge.handleMessage(`cv/${h1}`, Buffer.from("x"));
+    assert.equal(warns.filter((l) => /no friendship holds/.test(l)).length, 1,
+      "five messages on one unknown id produced more than one line");
 
-    await bridge.handleMessage(`c/${h2}`, Buffer.from("x"));
-    assert.equal(warns.filter((l) => /no friendship row/.test(l)).length, 2,
-      "a second broken hash is a second fact and was swallowed");
-    // The hash is truncated here too.
-    const said = warns.find((l) => /no friendship row/.test(l))!;
-    assert.ok(!said.includes(h1), "a full hash reached the log");
+    await bridge.handleMessage(`cv/${h2}`, Buffer.from("x"));
+    assert.equal(warns.filter((l) => /no friendship holds/.test(l)).length, 2,
+      "a second unknown id is a second fact and was swallowed");
+    // The id is truncated here too — it is a capability, and the log is not
+    // somewhere to publish one.
+    const said = warns.find((l) => /no friendship holds/.test(l))!;
+    assert.ok(!said.includes(h1), "a full topic id reached the log");
   });
 });
 
@@ -351,7 +352,7 @@ test("presence is unshared and conversations are shared", async () => {
   await withPush(CONFIGURED, async ({ push }) => {
     const subs = push.pushSubscriptions("pushbridge");
     const presence = subs.find((s) => s.topic.includes("presence"))!;
-    const convo = subs.find((s) => s.topic.includes("c/+"))!;
+    const convo = subs.find((s) => s.topic.includes("cv/+"))!;
 
     assert.ok(presence, `no presence subscription: ${JSON.stringify(subs)}`);
     assert.ok(!presence.topic.startsWith("$share/"),
@@ -372,7 +373,7 @@ test("the share group is configurable, and only the conversation topic uses it",
   // each other's messages and each wakes half its own users.
   await withPush(CONFIGURED, async ({ push }) => {
     const subs = push.pushSubscriptions("staging-bridge");
-    assert.ok(subs.some((s) => s.topic === "$share/staging-bridge/c/+"), JSON.stringify(subs));
+    assert.ok(subs.some((s) => s.topic === "$share/staging-bridge/cv/+"), JSON.stringify(subs));
     assert.ok(subs.every((s) => s.topic === "u/+/presence" || s.topic.includes("staging-bridge")),
       JSON.stringify(subs));
   });

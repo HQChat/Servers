@@ -95,7 +95,6 @@ async function cleanup(): Promise<void> {
   const ids = [...new Set(created)];
   for (const sql of [
     `DELETE FROM push_tokens WHERE id = ANY($1::text[])`,
-    `DELETE FROM mqtt_acl WHERE id = ANY($1::text[])`,
     `DELETE FROM friendships WHERE id_lo = ANY($1::text[]) OR id_hi = ANY($1::text[])`,
     `DELETE FROM users WHERE id = ANY($1::text[])`,
   ]) {

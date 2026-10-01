@@ -5,8 +5,9 @@
 // not the edges: it was every route's SUCCESS path. The existing api-routes.test
 // file could only exercise refusals, because the moment a friend route succeeds
 // it calls out to EMQX — `notifyGraphChanged`, `revokeTopic`, `kick` — and there
-// is no broker in a unit run. So the half that maintains the topic ACL, the
-// single mechanism separating one conversation from another, was untested.
+// is no broker in a unit run. So the half that hands out and retires a
+// friendship's topic ids — the single mechanism separating one conversation
+// from another — was untested.
 //
 // EMQX is stubbed here and its calls are RECORDED, because on these routes the
 // call to the broker is not a side effect of the behaviour — it IS the
@@ -50,6 +51,7 @@ const emqxStub = {
     kick: record("kick"),
     unsubscribe: record("unsubscribe"),
     revokeTopic: record("revokeTopic"),
+    revokeFriendshipTopics: record("revokeFriendshipTopics"),
     notifyGraphChanged: record("notifyGraphChanged"),
   },
 };
@@ -122,17 +124,15 @@ async function account(): Promise<Account> {
   const username = `t${crypto.randomBytes(6).toString("hex")}`;
   await DB.ensureUser(id, pkHex);
   await DB.setUsername(id, username);
-  await DB.grantSelfTopics(id);
   created.push(id);
   return { id, token: await DB.mintSessionToken(id, "free"), username };
 }
 
-/** Two accounts that are already friends, with the ACL granted. */
+/** Two accounts that are already friends. */
 async function friends(): Promise<[Account, Account]> {
   const a = await account();
   const b = await account();
   await DB.createFriendship(a.id, b.id);
-  await DB.grantFriendTopic(a.id, b.id);
   return [a, b];
 }
 
@@ -142,7 +142,6 @@ async function cleanup(): Promise<void> {
   if (!created.length) return;
   const ids = [...new Set(created)];
   for (const sql of [
-    `DELETE FROM mqtt_acl WHERE id = ANY($1::text[])`,
     `DELETE FROM mqtt_tokens WHERE id = ANY($1::text[])`,
     `DELETE FROM sessions WHERE id = ANY($1::text[])`,
     `DELETE FROM invites WHERE from_id = ANY($1::text[]) OR to_id = ANY($1::text[])`,
@@ -236,13 +235,13 @@ test("the ceiling is counted before the body is read", async (t) => {
   assert.equal(res.status, 429, `a missing "to" would be 400 if the body were read first: ${res.text}`);
 });
 
-// --- accepting, which is where the ACL is granted ---------------------------------------------
+// --- accepting, which is where the topic ids are handed out ------------------------------
 
-test("accepting an invite grants the conversation topic to BOTH members", async (t) => {
+test("accepting an invite hands the accepter the new friendship's topic ids", async (t) => {
   if (!(await pgAvailable())) return t.skip(NEEDS_PG);
-  // The friend rows alone are invisible to MQTT. The ACL entry is what lets
-  // either side use the shared topic — without it both clients authenticate and
-  // then cannot subscribe to the conversation they just created.
+  // The accepter greets immediately, so it needs the ids in THIS response rather
+  // than after a /friends round trip. And both members must get the same ids,
+  // or the two ends of one conversation sit on different topics.
   const a = await account();
   const b = await account();
   await call("POST", "/friends/invite", { to: b.username }, a.token);
@@ -251,18 +250,18 @@ test("accepting an invite grants the conversation topic to BOTH members", async 
   const res = await call("POST", "/friends/accept", { from: a.username }, b.token);
   assert.equal(res.status, 200, res.text);
   assert.equal(res.body.ok, true);
+  assert.equal(res.body.friend.id, a.id);
+  assert.match(res.body.friend.convo_id, /^[0-9a-f]{64}$/);
+  assert.match(res.body.friend.handshake_id, /^[0-9a-f]{64}$/);
 
-  const topic = `c/${friendshipHash(a.id, b.id)}`;
-  const acl = await q<{ id: string; topic: string }>(
-    `SELECT id, topic FROM mqtt_acl WHERE topic = $1`, [topic],
-  );
-  const holders = acl.rows.map((r) => r.id).sort();
-  assert.deepEqual(holders, [a.id, b.id].sort(), `only ${holders.length} member holds the topic`);
+  const listA = (await call("GET", "/friends", undefined, a.token)).body.friends;
+  const bAsSeenByA = listA.find((f: { id: string }) => f.id === b.id);
+  assert.equal(bAsSeenByA.convo_id, res.body.friend.convo_id, "the inviter is handed the same conversation");
+  assert.equal(bAsSeenByA.handshake_id, res.body.friend.handshake_id);
 
-  // Both sides are nudged, and AFTER the grant. The inviter is the one that
-  // matters: they invited a HANDLE, so their contact row holds no client id
-  // until a directory sync fills it in — and the accepter greets immediately, so
-  // that greeting used to reach the inviter before they knew who sent it.
+  // Both sides are nudged. The inviter is the one that matters: they invited a
+  // HANDLE, so their contact row holds no client id (or topic ids) until a
+  // directory sync fills it in — and the accepter greets immediately.
   const nudged = called("notifyGraphChanged");
   assert.equal(nudged.length, 1);
   assert.deepEqual([...(nudged[0]!.args[0] as string[])].sort(), [a.id, b.id].sort());
@@ -275,32 +274,30 @@ test("accepting an invite that was never sent creates nothing", async (t) => {
   const res = await call("POST", "/friends/accept", { from: a.username }, b.token);
   assert.equal(res.status, 400);
   assert.equal(res.body.ok, false);
-  assert.equal((await q(`SELECT 1 FROM mqtt_acl WHERE topic = $1`, [`c/${friendshipHash(a.id, b.id)}`])).rows.length, 0);
+  assert.equal(res.body.friend, undefined, "no topic ids for a friendship that does not exist");
+  assert.equal(await DB.areFriends(a.id, b.id), false);
   assert.deepEqual(called("notifyGraphChanged"), [], "nothing happened, so nobody is told");
 });
 
-// --- removing, which is where the ACL must come back -------------------------------------------
+// --- removing, which is where the topic ids are retired -------------------------------------------
 
-test("removing a friend revokes the topic in the database AND at the broker", async (t) => {
+test("removing a friend retires the topic ids AND drops both live subscriptions", async (t) => {
   if (!(await pgAvailable())) return t.skip(NEEDS_PG);
-  // Two separate revocations, and both are needed. The database row blocks the
-  // NEXT authorization check; authorization is checked at SUBSCRIBE, so a
-  // subscription that is already open keeps delivering until the client
-  // disconnects for its own reasons. The broker call is what ends it now.
+  // Deleting the row retires the ids — nobody is handed them again. But the
+  // ex-friend already HOLDS them, and a subscription that is already open keeps
+  // delivering; the broker call is what ends it now.
   const [a, b] = await friends();
-  const topic = `c/${friendshipHash(a.id, b.id)}`;
-  assert.ok((await q(`SELECT 1 FROM mqtt_acl WHERE topic = $1`, [topic])).rows.length > 0, "setup");
+  const topics = await DB.getFriendshipTopics(a.id, b.id);
+  assert.ok(topics, "setup");
   emqxCalls.length = 0;
 
   const res = await call("POST", "/friends/remove", { peer: b.username }, a.token);
   assert.equal(res.status, 200, res.text);
+  assert.equal(await DB.getFriendshipTopics(a.id, b.id), null, "the friendship survived the unfriend");
 
-  assert.equal((await q(`SELECT 1 FROM mqtt_acl WHERE topic = $1`, [topic])).rows.length, 0,
-    "the ACL rows survive the unfriend");
-
-  const revokes = called("revokeTopic");
-  assert.equal(revokes.length, 1, "the open subscription was never dropped");
-  assert.deepEqual(revokes[0]!.args, [a.id, b.id, topic]);
+  const revokes = called("revokeFriendshipTopics");
+  assert.equal(revokes.length, 1, "the open subscriptions were never dropped");
+  assert.deepEqual(revokes[0]!.args, [a.id, b.id, topics]);
   // The URL this builds used to be ~29 kB of public keys and EMQX answered 414
   // every single time. Ids are 64 characters now, and this is what keeps them so.
   for (const arg of revokes[0]!.args.slice(0, 2) as string[]) {
@@ -315,7 +312,7 @@ test("removing someone you are not friends with revokes nothing", async (t) => {
   const b = await account();
   const res = await call("POST", "/friends/remove", { peer: b.username }, a.token);
   assert.equal(res.status, 400);
-  assert.deepEqual(called("revokeTopic"), [], "a non-friendship must not touch the ACL");
+  assert.deepEqual(called("revokeFriendshipTopics"), [], "a non-friendship must not touch the broker");
 });
 
 test("a broker that refuses does not undo the unfriend", async (t) => {
@@ -325,13 +322,12 @@ test("a broker that refuses does not undo the unfriend", async (t) => {
   // as a 500 to the caller — the database change stands, so a retry is safe, and
   // pinning it means a future change to swallow the error is deliberate.
   const [a, b] = await friends();
-  const topic = `c/${friendshipHash(a.id, b.id)}`;
   emqxThrows = new Error("emqx unreachable");
   const res = await call("POST", "/friends/remove", { peer: b.username }, a.token);
   assert.equal(res.status, 500, res.text);
   assert.equal(res.body.error, "INTERNAL", "the broker's message must not reach the caller");
-  assert.equal((await q(`SELECT 1 FROM mqtt_acl WHERE topic = $1`, [topic])).rows.length, 0,
-    "the database revocation must stand even when the broker call fails");
+  assert.equal(await DB.areFriends(a.id, b.id), false,
+    "the unfriend must stand even when the broker call fails");
 });
 
 // --- cancelling ----------------------------------------------------------------------------------
@@ -529,7 +525,7 @@ test("deleting an account leaves no row anywhere, and ends the live connection",
   // an oversight — an oversight here is exactly the regression the loop exists
   // to catch. The two assertions under it pin both halves of the rule.
   for (const [table, col] of [
-    ["users", "id"], ["sessions", "id"], ["mqtt_tokens", "id"], ["mqtt_acl", "id"],
+    ["users", "id"], ["sessions", "id"], ["mqtt_tokens", "id"],
     ["push_tokens", "id"], ["prekeys_medium", "id"], ["prekeys_onetime", "id"],
     ["friendships", "id_lo"],
     // Both directions: a block this user placed and a block placed on them.
@@ -569,14 +565,11 @@ test("deleting an account leaves no row anywhere, and ends the live connection",
   assert.equal((await call("GET", "/friends", undefined, otherSession)).status, 401,
     "a second device's session outlived the account");
 
-  // The friend is untouched — their account is not ours to delete — and their
-  // dangling grant on this conversation is gone.
+  // The friend is untouched — their account is not ours to delete — and the
+  // friendship, with its topic ids, is gone from their list.
   assert.equal((await q(`SELECT 1 FROM users WHERE id = $1`, [b.id])).rows.length, 1);
-  assert.equal(
-    (await q(`SELECT 1 FROM mqtt_acl WHERE id = $1 AND topic = $2`,
-      [b.id, `c/${friendshipHash(a.id, b.id)}`])).rows.length, 0,
-    "the remaining friend keeps a grant on a topic whose other member is gone",
-  );
+  const left = (await call("GET", "/friends", undefined, b.token)).body.friends as Array<{ id: string }>;
+  assert.ok(!left.some((f) => f.id === a.id), "the remaining friend is still handed the deleted account's topics");
 });
 
 test("deletion needs a session, like everything else", async (t) => {
@@ -815,14 +808,9 @@ test("blocking ends the friendship, revokes the topic, and survives a re-invite"
   assert.equal(res.status, 200, res.text);
 
   assert.equal(await DB.areFriends(a.id, b.id), false, "the friendship survived the block");
-  assert.equal(
-    (await q(`SELECT 1 FROM mqtt_acl WHERE id = $1 AND topic = $2`,
-      [b.id, `c/${friendshipHash(a.id, b.id)}`])).rows.length, 0,
-    "the blocked peer keeps a grant on the conversation topic",
-  );
-  // The row edit stops the NEXT authorization check; an open subscription keeps
-  // delivering until this call lands (ASVS-1).
-  assert.equal(called("revokeTopic").length, 1, "the live subscription was left in place");
+  // The ids are retired with the row; the blocked peer still holds them, so the
+  // subscriptions already open on them are dropped now (ASVS-1).
+  assert.equal(called("revokeFriendshipTopics").length, 1, "the live subscriptions were left in place");
   assert.equal(called("notifyGraphChanged").length, 1, "neither side was told the graph changed");
 
   // The durable half. Without it the blocked party re-invites and the block has

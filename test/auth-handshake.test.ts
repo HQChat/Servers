@@ -89,7 +89,6 @@ async function cleanup(): Promise<void> {
   if (!created.length) return;
   const ids = [...new Set(created)];
   for (const sql of [
-    `DELETE FROM mqtt_acl WHERE id = ANY($1::text[]) OR peer_id = ANY($1::text[])`,
     `DELETE FROM mqtt_tokens WHERE id = ANY($1::text[])`,
     `DELETE FROM sessions WHERE id = ANY($1::text[])`,
     `DELETE FROM friendships WHERE id_a = ANY($1::text[]) OR id_b = ANY($1::text[])`,
@@ -375,7 +374,7 @@ test("an uppercase key is the same identity as its lowercase form", async (t) =>
 
 // --- what a successful login leaves behind ------------------------------------------------
 
-test("a login records the identity key and opens the client's own topics", async (t) => {
+test("a login records the identity key", async (t) => {
   if (!(await pgAvailable())) return t.skip(NEEDS_PG);
   // `users.identity_pk` is written HERE and nowhere else — this is the moment
   // the caller has proved it holds the secret key, and it is what makes
@@ -389,11 +388,9 @@ test("a login records the identity key and opens the client's own topics", async
   assert.equal(user.rows.length, 1, "the login did not record the user");
   assert.equal(user.rows[0]!.identity_pk, me.pkHex);
 
-  // Self topics are what the free tier IS: presence and an inbox, no friend
-  // grants. Without the ACL rows the client authenticates and then cannot
-  // subscribe to anything.
-  const acl = await q<{ topic: string }>(`SELECT * FROM mqtt_acl WHERE id = $1`, [me.id]);
-  assert.ok(acl.rows.length > 0, "no ACL rows — the client could not use any topic");
+  // No topic rows either: the broker's ACL is static and keys the client's own
+  // topics on its authenticated clientid (infra/deploy/emqx/acl.conf), so a
+  // login has nothing to open.
 });
 
 test("the paid door mints a premium scope", async (t) => {

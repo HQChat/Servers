@@ -20,10 +20,10 @@ import { tls, withoutSslMode } from "./ssl";
 
 const DIR = path.join(__dirname, "migrations");
 
-// The role names differ per environment — `app_prod` / `emqx_prod` on the managed
-// cluster, whatever the local container uses elsewhere — so they cannot be
-// hardcoded in a .sql file. These two are the only substitutions the runner
-// performs, and both default to the connecting user, which is what makes a
+// The role name differs per environment — `app_prod` on the managed cluster,
+// whatever the local container uses elsewhere — so it cannot be hardcoded in a
+// .sql file. It is the only substitution the runner performs, and it defaults to
+// the connecting user, which is what makes a
 // single-superuser container need no setup at all.
 function roles(fallback: string) {
   const named = (name: string) => {
@@ -36,7 +36,7 @@ function roles(fallback: string) {
     }
     return v;
   };
-  return { APP_ROLE: named("APP_ROLE"), EMQX_ROLE: named("EMQX_ROLE") };
+  return { APP_ROLE: named("APP_ROLE") };
 }
 
 async function main() {
@@ -79,7 +79,7 @@ async function main() {
     if (applied.has(file)) continue;
     const sql = fs
       .readFileSync(path.join(DIR, file), "utf8")
-      .replace(/\$\{(APP_ROLE|EMQX_ROLE)\}/g, (_, k: keyof typeof subs) => subs[k]);
+      .replace(/\$\{(APP_ROLE)\}/g, (_, k: keyof typeof subs) => subs[k]);
 
     logger.startup(`[migrate] applying ${file}`);
     try {

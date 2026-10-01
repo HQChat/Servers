@@ -33,7 +33,7 @@ const V = JSON.parse(
   version: number;
   publicKeyBytes: number;
   keys: Array<{ label: string; publicKeyHex: string; id: string }>;
-  friendships: Array<{ a: string; b: string; hash: string; topic: string }>;
+  friendships: Array<{ a: string; b: string; hash: string }>;
 };
 
 test("the vector file is the shape both suites expect", () => {
@@ -130,14 +130,15 @@ test("the id is NOT chainId — chainId is the same digest truncated to 32", () 
 
 // ── friendshipHash ──────────────────────────────────────────────────────────
 //
-// The conversation topic. 001_schema.sql has claimed since it was written that
-// this has "a Swift counterpart and a cross-impl test vector"; the counterpart
-// existed, the vector did not.
+// The value `/report` names a conversation by — it was the conversation TOPIC
+// until topics became random per-friendship ids (009_friendship_topics.sql).
+// 001_schema.sql had claimed since it was written that this has "a Swift
+// counterpart and a cross-impl test vector"; the counterpart existed, the
+// vector did not.
 
 test("friendshipHash matches the pinned vectors", () => {
   for (const f of V.friendships) {
     assert.equal(friendshipHash(f.a, f.b), f.hash);
-    assert.equal(`c/${f.hash}`, f.topic);
   }
 });
 
@@ -145,12 +146,6 @@ test("friendshipHash is order-independent, which is why one row serves both", ()
   const [ab, ba] = [V.friendships[0]!, V.friendships[1]!];
   assert.deepEqual([ab.a, ab.b].sort(), [ba.a, ba.b].sort(), "the same pair, reversed");
   assert.equal(ab.hash, ba.hash);
-});
-
-test("a conversation topic is now 66 characters, not ~29000", () => {
-  // `c/{hash}` used to embed two public keys' worth of hash input and, in
-  // mqtt_acl, sat beside a 14474-character `pk` in the same row.
-  assert.equal(V.friendships[0]!.topic.length, 66);
 });
 
 // ── The Postgres half ───────────────────────────────────────────────────────
